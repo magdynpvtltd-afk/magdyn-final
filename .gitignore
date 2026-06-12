@@ -1,0 +1,6 @@
+# Delta packages (build artifacts, regenerable)
+magdyn-app_delta_*.zip
+delta_*.zip
+
+# Claude Code tooling state
+.claude/

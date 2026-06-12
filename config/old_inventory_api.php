@@ -31,6 +31,11 @@ return [
     // (legacy `inspection` table → one inspection template per product pid)
     'inspections_url' => 'http://192.168.1.249/inventory/api_export_inspections.php',
 
+    // Full URL to api_export_audit_users.php on the old server
+    // (per-record created_by / modified_by usernames + inspection done_by;
+    //  consumed by the admin "Creator Backfill" module)
+    'creator_audit_url' => 'http://192.168.1.249/inventory/api_export_audit_users.php',
+
     // Shared secret — must match API_TOKEN defined in both export files
     'token'   => 'MAGDYN_IMPORT_SECRET',
 
