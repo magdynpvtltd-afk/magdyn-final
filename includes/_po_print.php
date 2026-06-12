@@ -451,23 +451,26 @@ function po_render_print_html($poId, array $opts = [])
         </tr>
     </thead>
     <tbody>
-        <?php if (!$lines): ?>
-            <tr><td colspan="4" class="ctr small" style="padding:8px;">No items.</td></tr>
-        <?php else:
-            foreach ($lines as $idx => $l):
-                $isAsset = $l['entity_type'] === 'asset';
-                $code = $isAsset ? ($l['asset_tag'] ?: '—') : ($l['item_code'] ?: '—');
-                $desc = $isAsset ? ($l['asset_model'] ?: '') : ($l['item_name'] ?: ($l['pending_name'] ?? ''));
-                $qty  = rtrim(rtrim(number_format((float)($l['qty_planned'] ?? 0), 2), '0'), '.');
-                $lineDate = !empty($l['delivery_date']) ? h($l['delivery_date']) : '';
+        <?php
+        // Show only material actually issued/shipped to the vendor
+        // (qty_shipped > 0). When nothing has shipped yet, the section is
+        // intentionally left empty.
+        $imIdx = 0;
+        foreach ($lines as $l):
+            if ((float)($l['qty_shipped'] ?? 0) <= 0) continue;
+            $isAsset = $l['entity_type'] === 'asset';
+            $code = $isAsset ? ($l['asset_tag'] ?: '—') : ($l['item_code'] ?: '—');
+            $desc = $isAsset ? ($l['asset_model'] ?: '') : ($l['item_name'] ?: ($l['pending_name'] ?? ''));
+            $qty  = rtrim(rtrim(number_format((float)($l['qty_shipped'] ?? 0), 2), '0'), '.');
+            $lineDate = !empty($l['delivery_date']) ? h($l['delivery_date']) : '';
         ?>
             <tr>
-                <td class="ctr"><?= $idx + 1 ?></td>
+                <td class="ctr"><?= ++$imIdx ?></td>
                 <td><?= h($code) ?><?= $desc ? ' — ' . h($desc) : '' ?></td>
                 <td class="ctr"><?= h($qty) ?></td>
                 <td class="ctr"><?= $lineDate ?></td>
             </tr>
-        <?php endforeach; endif; ?>
+        <?php endforeach; ?>
     </tbody>
 </table>
 

@@ -28,15 +28,18 @@
  *   unitofmeasured                             → unit
  *   stepno                                     → sort_order
  *   toltype + NomValue                         → check_type:
- *       'notes'    → notes
- *       'logic'    → logic   (operator picks pass/fail)
- *       'min-max'  → nom     (old min-max stored target ± offsets too)
- *       numeric NomValue → nom (target ± Tolneg/Tolpos)
+ *       'notes'           → notes
+ *       'logic'           → logic   (operator picks pass/fail)
+ *       'min/max'/'min-max' → min-max (legacy minimum/maximum → bounds)
+ *       'nom' / numeric NomValue → nom (target ± Tolneg/Tolpos)
  *       NomValue 'NA'/blank + visual method → visual
- *       otherwise  → text
+ *       otherwise         → text
+ *   minimum / maximum            → tolerance_lower / tolerance_upper
+ *                                  (min-max checks — lower IS min, upper IS max)
  *   NomValue / Tolneg / Tolpos → target_value / tolerance_lower / upper
- *                                (numeric checks only)
- *   HowMeasured / ProcessStep / DrawingNo+Rev / notes / description
+ *                                (nom checks only)
+ *   notes                      → notes (dedicated template-item field)
+ *   HowMeasured / ProcessStep / DrawingNo+Rev / description
  *                              → folded into the item description text
  *
  * Re-running UPDATES templates keyed by code 'OINS-<pid>' (items + target
@@ -283,20 +286,24 @@ class OldInventoryInspectionTemplateImportService
         $nom     = trim((string)($r['NomValue'] ?? ''));
         $tolNeg  = trim((string)($r['Tolneg'] ?? ''));
         $tolPos  = trim((string)($r['Tolpos'] ?? ''));
+        $minVal  = trim((string)($r['minimum'] ?? ''));
+        $maxVal  = trim((string)($r['maximum'] ?? ''));
         $toltype = strtolower(trim((string)($r['toltype'] ?? '')));
 
         $nomIsNumeric = ($nom !== '' && strcasecmp($nom, 'NA') !== 0 && is_numeric($nom));
 
-        // Resolve check_type.
+        // Resolve check_type from the legacy toltype. The old data stores the
+        // min/max kind as 'min/max' (slash form, the common case) or 'min-max'.
+        $isMinMax = ($toltype === 'min/max' || $toltype === 'min-max' || $toltype === 'minmax');
+
         if ($toltype === 'notes') {
             $checkType = 'notes';
         } elseif ($toltype === 'logic') {
             $checkType = 'logic';
-        } elseif ($toltype === 'min-max') {
-            // Old min-max rows still stored a nominal + ± offsets, so treat
-            // them as nom for faithful tolerance evaluation.
-            $checkType = 'nom';
-        } elseif ($nomIsNumeric) {
+        } elseif ($isMinMax) {
+            // Carry the legacy minimum/maximum columns as the bounds.
+            $checkType = 'min-max';
+        } elseif ($toltype === 'nom' || $nomIsNumeric) {
             $checkType = 'nom';
         } elseif (stripos($how, 'visual') !== false || strcasecmp($param, 'Visual') === 0) {
             $checkType = 'visual';
@@ -307,9 +314,14 @@ class OldInventoryInspectionTemplateImportService
             $checkType = 'text';
         }
 
-        // Numeric spec — only carried for nominal-style checks.
+        // Numeric spec — carried for nominal- and min/max-style checks.
         $target = null; $lower = null; $upper = null;
-        if ($checkType === 'nom' && $nomIsNumeric) {
+        if ($checkType === 'min-max') {
+            // MIN-MAX semantics: tolerance_lower IS the min, tolerance_upper IS
+            // the max (from the legacy `minimum` / `maximum` columns).
+            if ($minVal !== '' && is_numeric($minVal)) { $lower = (float)$minVal; }
+            if ($maxVal !== '' && is_numeric($maxVal)) { $upper = (float)$maxVal; }
+        } elseif ($checkType === 'nom' && $nomIsNumeric) {
             $target = (float)$nom;
             if ($tolNeg !== '' && is_numeric($tolNeg)) { $lower = (float)$tolNeg; }
             if ($tolPos !== '' && is_numeric($tolPos)) { $upper = (float)$tolPos; }
@@ -324,20 +336,29 @@ class OldInventoryInspectionTemplateImportService
 
         $description = $this->buildItemDescription($r, $how, $step);
 
+        // Legacy `notes` lands in the dedicated template-item notes field (it
+        // is NOT folded into the description blob — see buildItemDescription).
+        $notes = trim((string)($r['notes'] ?? ''));
+        $notes = $notes !== '' ? $notes : null;
+
         db_exec(
             'INSERT INTO inspection_template_items
                (template_id, sort_order, label, bubble_no, gdt_symbol, description,
-                check_type, target_value, tolerance_lower, tolerance_upper,
+                notes, check_type, target_value, tolerance_lower, tolerance_upper,
                 unit, is_required)
-             VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 1)',
+             VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 1)',
             [$templateId, $sort, $label, $bb,
-             $description !== '' ? $description : null,
+             $description !== '' ? $description : null, $notes,
              $checkType, $target, $lower, $upper, $unit]
         );
         $this->counts['item_created']++;
     }
 
-    /** Fold the descriptive legacy fields into one item description blob. */
+    /**
+     * Fold the descriptive legacy fields into one item description blob.
+     * The legacy `notes` column is intentionally NOT included here — it now
+     * has its own dedicated template-item `notes` field (see importItem()).
+     */
     private function buildItemDescription(array $r, string $how, string $step): string
     {
         $parts = [];
@@ -352,7 +373,6 @@ class OldInventoryInspectionTemplateImportService
         if ($mat !== '') { $parts[] = 'Material: ' . $mat; }
 
         $notes = trim((string)($r['notes'] ?? ''));
-        if ($notes !== '') { $parts[] = $notes; }
         $legacyDesc = trim((string)($r['description'] ?? ''));
         if ($legacyDesc !== '' && $legacyDesc !== '.' && strcasecmp($legacyDesc, $notes) !== 0) {
             $parts[] = $legacyDesc;

@@ -126,8 +126,8 @@ function shr_item_picker_options()
 // Chain:
 //   notes(entity_type='inv_txn', entity_id = inv_txns.id)
 //     → inv_txns.ref_doc = 'OLD-ITX-<old_id>'
-//     → old_inv_txns.old_id → old_inv_txns.old_transaction_id
-//     → inv_shipment_lines.old_transaction_id
+//     → old_inv_txns.old_id (= inventory_transaction_id)
+//     → inv_shipment_lines.old_transaction_id (also the inventory_transaction_id)
 //
 // PERF: these queries drive from `notes` (the small end — only the
 // inv_txn-class rows) DOWN to inv_shipment_lines, reaching old_inv_txns
@@ -147,7 +147,7 @@ function _shr_txn_notes_join()
     return "FROM notes n
             JOIN inv_txns t            ON t.id = n.entity_id
             JOIN old_inv_txns o        ON o.old_id = CAST(SUBSTRING(t.ref_doc, 9) AS UNSIGNED)
-            JOIN inv_shipment_lines sl ON sl.old_transaction_id = o.old_transaction_id
+            JOIN inv_shipment_lines sl ON sl.old_transaction_id = o.old_id
            WHERE n.entity_type = 'inv_txn' AND n.is_deleted = 0
              AND t.ref_doc LIKE 'OLD-ITX-%'";
 }
@@ -187,13 +187,13 @@ function shr_shipment_txn_notes($shipmentId)
     $shipmentId = (int)$shipmentId;
     $notes = db_all(
         "SELECT DISTINCT n.id, n.body_html, n.created_at, n.entity_id AS inv_txn_id,
-                o.old_transaction_id,
+                o.old_id AS old_transaction_id,
                 u.full_name AS author_name, u.email AS author_email,
                 c.name AS note_type_name
            FROM notes n
            JOIN inv_txns t            ON t.id = n.entity_id
            JOIN old_inv_txns o        ON o.old_id = CAST(SUBSTRING(t.ref_doc, 9) AS UNSIGNED)
-           JOIN inv_shipment_lines sl ON sl.old_transaction_id = o.old_transaction_id
+           JOIN inv_shipment_lines sl ON sl.old_transaction_id = o.old_id
       LEFT JOIN users u               ON u.id = n.author_id
       LEFT JOIN categories c          ON c.id = n.note_type_id
           WHERE n.entity_type = 'inv_txn' AND n.is_deleted = 0
@@ -3263,19 +3263,19 @@ if ($action === 'view') {
 
     // Running notes that were attached, in the old system, to the transactions
     // behind this shipment's lines. Chain:
-    //   inv_shipment_lines.old_transaction_id  (legacy transaction header)
-    //     → old_inv_txns.old_transaction_id → old_inv_txns.old_id (inventory_transaction_id)
+    //   inv_shipment_lines.old_transaction_id  (= inventory_transaction_id)
+    //     → old_inv_txns.old_id (inventory_transaction_id)
     //     → inv_txns.ref_doc = 'OLD-ITX-<old_id>'
     //     → notes(entity_type='inv_txn', entity_id = inv_txns.id)
     // (inv_notes.tid is an inventory_transaction_id; the importer attached the
     //  note to the matching inv_txn, so we roll those up to the shipment here.)
     $txnNotes = db_all(
         "SELECT DISTINCT n.id, n.body_html, n.created_at, n.entity_id AS inv_txn_id,
-                o.old_transaction_id,
+                o.old_id AS old_transaction_id,
                 u.full_name AS author_name, u.email AS author_email,
                 c.name AS note_type_name
            FROM inv_shipment_lines sl
-           JOIN old_inv_txns o ON o.old_transaction_id = sl.old_transaction_id
+           JOIN old_inv_txns o ON o.old_id = sl.old_transaction_id
            JOIN inv_txns t     ON t.ref_doc = CONCAT('OLD-ITX-', o.old_id)
            JOIN notes n        ON n.entity_type = 'inv_txn' AND n.entity_id = t.id AND n.is_deleted = 0
       LEFT JOIN users u        ON u.id = n.author_id
@@ -3526,7 +3526,7 @@ if ($action === 'view') {
                         </td>
                         <td class="r">
                             <?php if (!empty($L['old_transaction_id'])): ?>
-                                <code title="Legacy transaction.transaction_id this line was imported from"><?= (int)$L['old_transaction_id'] ?></code>
+                                <code title="Legacy inventory_transaction.inventory_transaction_id this line was imported from"><?= (int)$L['old_transaction_id'] ?></code>
                             <?php else: ?>
                                 <span class="muted">—</span>
                             <?php endif; ?>
@@ -4179,7 +4179,7 @@ $rowRenderer = function ($r) use ($canManage, &$shipmentNoteCounts) {
         'ship_no'       => $shipLink,
         'po_no'         => $poCell,
         'old_txn'       => !empty($r['old_transaction_id'])
-            ? '<code title="Legacy transaction.transaction_id">' . (int)$r['old_transaction_id'] . '</code>'
+            ? '<code title="Legacy inventory_transaction.inventory_transaction_id">' . (int)$r['old_transaction_id'] . '</code>'
             : '<span class="muted">—</span>',
         'vendor'        => $vendor,
         'item_label'    => $itemCell,

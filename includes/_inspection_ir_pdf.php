@@ -25,10 +25,13 @@ require_once __DIR__ . '/vendor/autoload.php';
  *
  * Caller is responsible for unlinking the file after streaming it.
  */
-function ir_render_pdf($inspectionId, $tempDir = null)
+function ir_render_pdf($inspectionId, $tempDir = null, array $opts = [])
 {
     $inspectionId = (int)$inspectionId;
-    $html = ir_render_print_html($inspectionId, ['include_actions_bar' => false]);
+    $html = ir_render_print_html($inspectionId, [
+        'include_actions_bar' => false,
+        'po_no_override'      => $opts['po_no_override'] ?? null,
+    ]);
     if ($html === null) return null;
 
     // Resolve IR reference for the filename

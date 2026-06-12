@@ -1616,12 +1616,15 @@ if ($action === 'save') {
                 if (!in_array($pf, $allowedPF, true)) $pf = 'pending';
             } elseif ($ct === 'notes') {
                 $pf = 'na';
-            } elseif ($ct === 'logic') {
-                // User selected pass/fail directly via dropdown; stored in measured_value.
+            } elseif (ir_is_select_passfail($ct)) {
+                // Operator picked pass/fail directly via the dropdown
+                // (logic / logical-nom / logical-min-max); the verdict is
+                // stored verbatim in measured_value.
                 $lv = strtolower(trim((string)$val));
                 $pf = ($lv === 'pass') ? 'pass' : (($lv === 'fail') ? 'fail' : 'pending');
             } elseif (ir_auto_passfail($ct)) {
-                // Auto-evaluate: numeric, logical-nom, logical-min-max.
+                // Auto-evaluate the numeric reading vs its spec:
+                // numeric / nom / min-max.
                 list($minV, $maxV) = ir_min_max_for_type(
                     $ct, $r['target_value'], $r['tolerance_lower'], $r['tolerance_upper']
                 );
@@ -1630,8 +1633,8 @@ if ($action === 'save') {
                     $pf = 'pending';
                 }
             } else {
-                // NOM, MIN/MAX, boolean, visual, text — no auto pass/fail.
-                $pf = ($val === null || $val === '') ? 'pending' : 'pending';
+                // boolean, visual, text — no auto pass/fail.
+                $pf = 'pending';
             }
             $nt = isset($rnotes[$rid]) ? (string)$rnotes[$rid] : null;
             db_exec(
@@ -1847,6 +1850,7 @@ if ($action === 'template_save') {
         db_exec('DELETE FROM inspection_template_items WHERE template_id = ?', [$id]);
         $labels  = is_array(input('item_label', [])) ? input('item_label', []) : [];
         $bubbles = is_array(input('item_bubble_no', [])) ? input('item_bubble_no', []) : [];
+        $itnotes = is_array(input('item_notes', [])) ? input('item_notes', []) : [];
         $gdts    = is_array(input('item_gdt_symbol', [])) ? input('item_gdt_symbol', []) : [];
         $types   = is_array(input('item_check_type', [])) ? input('item_check_type', []) : [];
         $tgts    = is_array(input('item_target_value', [])) ? input('item_target_value', []) : [];
@@ -1905,6 +1909,8 @@ if ($action === 'template_save') {
             $gd = $gd === '' ? null : mb_substr($gd, 0, 8);
             $bb = isset($bubbles[$i]) ? trim((string)$bubbles[$i]) : '';
             $bb = $bb === '' ? null : mb_substr($bb, 0, 8);
+            $nt = isset($itnotes[$i]) ? trim((string)$itnotes[$i]) : '';
+            $nt = $nt === '' ? null : $nt;
             $tg = isset($tgts[$i]) && $tgts[$i] !== '' ? (float)$tgts[$i] : null;
             $lo = isset($los[$i])  && $los[$i]  !== '' ? (float)$los[$i]  : null;
             $hi = isset($his[$i])  && $his[$i]  !== '' ? (float)$his[$i]  : null;
@@ -1934,12 +1940,12 @@ if ($action === 'template_save') {
 
             db_exec(
                 'INSERT INTO inspection_template_items
-                   (template_id, sort_order, label, bubble_no, gdt_symbol, check_type,
+                   (template_id, sort_order, label, bubble_no, gdt_symbol, notes, check_type,
                     target_value, tolerance_lower, tolerance_upper, unit, is_required,
                     instrument_asset_id,
                     source_attachment_id, bubble_page, bubble_grid_cell, bubble_x, bubble_y)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                [$id, $sort++, $lbl, $bb, $gd, $ct, $tg, $lo, $hi, $un ?: null, $rq,
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [$id, $sort++, $lbl, $bb, $gd, $nt, $ct, $tg, $lo, $hi, $un ?: null, $rq,
                  $inAsset,
                  $aId, $bbPage, $bbCell, $bbX, $bbY]
             );
@@ -2035,12 +2041,13 @@ if ($action === 'template_clone') {
     foreach (db_all('SELECT * FROM inspection_template_items WHERE template_id = ? ORDER BY sort_order, id', [$srcId]) as $it) {
         db_exec(
             'INSERT INTO inspection_template_items
-               (template_id, sort_order, label, bubble_no, gdt_symbol, description, check_type,
+               (template_id, sort_order, label, bubble_no, gdt_symbol, description, notes, check_type,
                 target_value, tolerance_lower, tolerance_upper, unit, is_required,
                 instrument_asset_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             [$newId, $it['sort_order'], $it['label'],
              $it['bubble_no'] ?? null, $it['gdt_symbol'] ?? null, $it['description'] ?? null,
+             $it['notes'] ?? null,
              $it['check_type'], $it['target_value'], $it['tolerance_lower'],
              $it['tolerance_upper'], $it['unit'], $it['is_required'],
              $it['instrument_asset_id'] ?? null]
@@ -2466,7 +2473,7 @@ if ($action === 'template_export') {
     echo "\xEF\xBB\xBF";
     $out = fopen('php://output', 'w');
     fputcsv($out, ['bubble_no', 'label', 'gdt_symbol', 'check_type', 'target_value',
-                   'tolerance_lower', 'tolerance_upper', 'unit', 'is_required', 'description']);
+                   'tolerance_lower', 'tolerance_upper', 'unit', 'is_required', 'description', 'notes']);
     foreach ($items as $it) {
         fputcsv($out, [
             $it['bubble_no'] ?? '',
@@ -2479,6 +2486,7 @@ if ($action === 'template_export') {
             $it['unit'] ?? '',
             (int)$it['is_required'],
             $it['description'] ?? '',
+            $it['notes'] ?? '',
         ]);
     }
     fclose($out);
@@ -2567,13 +2575,14 @@ if ($action === 'template_import_csv') {
         $un  = $get('unit') ?: null;
         $rq  = (int)$get('is_required') ? 1 : 0;
         $desc = $get('description') ?: null;
+        $nts  = $get('notes') ?: null;
 
         db_exec(
             'INSERT INTO inspection_template_items
-               (template_id, sort_order, label, bubble_no, gdt_symbol, description, check_type,
+               (template_id, sort_order, label, bubble_no, gdt_symbol, description, notes, check_type,
                 target_value, tolerance_lower, tolerance_upper, unit, is_required)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            [$newId, $sort++, $label, $bub, $gdt, $desc, $ct, $tg, $lo, $hi, $un, $rq]
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [$newId, $sort++, $label, $bub, $gdt, $desc, $nts, $ct, $tg, $lo, $hi, $un, $rq]
         );
         $imported++;
     }
@@ -2955,7 +2964,7 @@ if ($action === 'template_view') {
                         }
                     ?>
                         <tr>
-                            <td class="muted small"><?= (int)($it['bubble_no'] ?: ($idx + 1)) ?></td>
+                            <td class="muted small"><?= h((string)($it['bubble_no'] ?: ($idx + 1))) ?></td>
                             <td><strong><?= h($it['label']) ?></strong>
                                 <?php if ($it['notes'] ?? ''): ?>
                                     <div class="muted small"><?= h($it['notes']) ?></div>
@@ -3511,16 +3520,17 @@ if ($action === 'template_edit' || $action === 'template_new') {
                         <tr>
                             <th style="width: 5%;" title="Balloon number on the engineering drawing">Bbl</th>
                             <th style="width: 5%;" title="Grid cell location on the drawing (e.g. A3)">Grid</th>
-                            <th style="width: 17%;">Label</th>
-                            <th style="width: 8%;">GD&amp;T</th>
-                            <th style="width: 10%;">Check type</th>
-                            <th style="width: 9%;">Target</th>
-                            <th style="width: 9%;">Tol −</th>
-                            <th style="width: 9%;">Tol +</th>
-                            <th style="width: 12%;">Unit</th>
-                            <th style="width: 12%;" title="Instrument used for this measurement (active assets only)">Instrument</th>
-                            <th style="width: 6%;">Req.</th>
-                            <th style="width: 7%;"></th>
+                            <th style="width: 15%;">Label</th>
+                            <th style="width: 7%;">GD&amp;T</th>
+                            <th style="width: 9%;">Check type</th>
+                            <th style="width: 8%;">Target</th>
+                            <th style="width: 8%;">Tol −</th>
+                            <th style="width: 8%;">Tol +</th>
+                            <th style="width: 9%;">Unit</th>
+                            <th style="width: 10%;" title="Instrument used for this measurement (active assets only)">Instrument</th>
+                            <th style="width: 11%;" title="Free-text note shown on the inspection view and printed/PDF report">Notes</th>
+                            <th style="width: 5%;">Req.</th>
+                            <th style="width: 5%;"></th>
                         </tr>
                     </thead>
                     <tbody id="tpl-items-body">
@@ -3565,6 +3575,7 @@ if ($action === 'template_edit' || $action === 'template_new') {
                             <td><input type="text" name="item_tolerance_upper[]"  class="item-spec-upper"  value="<?= h($it['tolerance_upper']) ?>"></td>
                             <td><?= $renderUomSelect($it['unit'] ?? '') ?></td>
                             <td><?= $renderInstrumentSelect($it['instrument_asset_id'] ?? 0) ?></td>
+                            <td><input type="text" name="item_notes[]" value="<?= h($it['notes'] ?? '') ?>" placeholder="(optional)"></td>
                             <td class="c"><input type="checkbox" name="item_required[<?= $rowIdx ?>]" value="1" <?= $it['is_required'] ? 'checked' : '' ?>></td>
                             <td class="r"><button type="button" class="btn btn-icon btn-danger tpl-item-del" title="Remove">🗑</button></td>
                         </tr>
@@ -3602,6 +3613,7 @@ if ($action === 'template_edit' || $action === 'template_new') {
                             <td><input type="text" name="item_tolerance_upper[]"  class="item-spec-upper"></td>
                             <td><?= $renderUomSelect('') ?></td>
                             <td><?= $renderInstrumentSelect(0) ?></td>
+                            <td><input type="text" name="item_notes[]" placeholder="(optional)"></td>
                             <td class="c"><input type="checkbox" name="item_required[<?= $i ?>]" value="1"></td>
                             <td class="r"><button type="button" class="btn btn-icon btn-danger tpl-item-del" title="Remove">🗑</button></td>
                         </tr>
@@ -3657,6 +3669,7 @@ if ($action === 'template_edit' || $action === 'template_new') {
               '<td><input type="text" name="item_tolerance_upper[]" class="item-spec-upper"></td>' +
               '<td>' + uomSelectHtml + '</td>' +
               '<td>' + instrSelectHtml + '</td>' +
+              '<td><input type="text" name="item_notes[]" placeholder="(optional)"></td>' +
               '<td class="c"><input type="checkbox" name="item_required[]" value="1"></td>' +
               '<td class="r"><button type="button" class="btn btn-icon btn-danger tpl-item-del" title="Remove">🗑</button></td>';
             return tr;
@@ -4404,17 +4417,25 @@ if ($action === 'view') {
     // IR view shows the latest. If the operator wants the IR locked
     // to a specific drawing rev, they edit the inv_items row before
     // closing the inspection.
-    $dwgNo = $dwgRev = null;
-    if ($row['entity_type'] === 'inv_item' && (int)$row['entity_id']) {
-        $dwgRow = db_one(
-            'SELECT dwg_no, dwg_rev_no FROM inv_items WHERE id = ?',
-            [(int)$row['entity_id']]
-        );
-        if ($dwgRow) {
-            $dwgNo  = $dwgRow['dwg_no']     ?: null;
-            $dwgRev = $dwgRow['dwg_rev_no'] ?: null;
-        }
-    }
+    // Inspected item — live resolve (covers inv_item AND inv_txn). Part
+    // No / Rev / Desc and the drawing come from the actual item so the
+    // on-screen header matches the printed IR.
+    $resolvedItem = ir_resolve_inspected_item($row);
+    $invItem      = $resolvedItem['item'];
+    $dwgNo        = ($invItem['dwg_no']     ?? null) ?: null;
+    $dwgRev       = ($invItem['dwg_rev_no'] ?? null) ?: null;
+
+    // Display part identity — prefer the live item, fall back to the
+    // creation-time snapshot columns.
+    $hdrPartNo   = ($invItem['part_no']     ?? null) ?: ($row['part_no']    ?? '');
+    $hdrPartRev  = ($invItem['part_rev_no'] ?? null) ?: ($row['part_rev']   ?? '');
+    $hdrPartDesc = ($invItem['name']        ?? null) ?: ($row['part_description'] ?? '');
+
+    // Header quantities (PDN = txn qty or sample qty; Chkd = sample qty;
+    // Accepted = count of accepted samples) — shares the print renderer's
+    // rules via ir_header_quantities().
+    $hdrGrid = ir_results_grid($id);
+    $hdrQtys = ir_header_quantities($row, $hdrGrid['params'], $hdrGrid['grid']);
     // Has-any-IR-data switch — older inspections that predate the IR
     // migration have none of these and we skip the IR header card for
     // a cleaner look.
@@ -4508,8 +4529,15 @@ if ($action === 'view') {
     $actionsHtml .= ' <a class="btn btn-icon" title="Print IR" aria-label="Print IR" target="_blank"'
                  .  ' href="' . h(url('/inspection.php?action=print&id=' . $id)) . '">'
                  .  '🖨 <span class="dt-action-label">Print IR</span></a>';
+    // Direct PDF download — prompt for the PO No (with line number) first
+    // so the printed/PDF report carries it, mirroring the print dialog.
+    $pdfBase = h(url('/inspection.php?action=download_pdf&id=' . $id));
     $actionsHtml .= ' <a class="btn btn-icon" title="Download PDF" aria-label="Download PDF" target="_blank"'
-                 .  ' href="' . h(url('/inspection.php?action=download_pdf&id=' . $id)) . '">'
+                 .  ' data-base="' . $pdfBase . '" href="' . $pdfBase . '"'
+                 .  ' onclick="var b=this.getAttribute(\'data-base\');'
+                 .  'var p=window.prompt(\'PO No with line number (leave blank to skip):\',\'\');'
+                 .  'if(p===null){return false;}'
+                 .  'this.href=b+(p.trim()?(\'&po_no=\'+encodeURIComponent(p.trim())):\'\');return true;">'
                  .  '⬇ <span class="dt-action-label">PDF</span></a>';
     ?>
     <div class="form-page">
@@ -4560,9 +4588,9 @@ if ($action === 'view') {
                         </div>
                         <div class="field"><label>Part no.</label>
                             <div>
-                                <strong><?= h($row['part_no'] ?: '—') ?></strong>
-                                <?php if (!empty($row['part_rev'])): ?>
-                                    <span class="muted small">Rev <?= h($row['part_rev']) ?></span>
+                                <strong><?= h($hdrPartNo ?: '—') ?></strong>
+                                <?php if (!empty($hdrPartRev)): ?>
+                                    <span class="muted small">Rev <?= h($hdrPartRev) ?></span>
                                 <?php endif; ?>
                             </div>
                         </div>
@@ -4593,27 +4621,28 @@ if ($action === 'view') {
                             </div>
                         </div>
                         <?php
-                        // Accepted qty = PDN qty per confirmed business
-                        // rule. If the inspection later moves to
-                        // status=failed/rework/hold/cancelled we surface
-                        // that via the status pill above; we don't
-                        // mutate the printed Accepted figure.
-                        $pdnQty      = $jcInfo['pdn_qty'] ?? null;
-                        $acceptedQty = $pdnQty;
+                        // Quantities follow the IR rules: PDN = txn qty
+                        // (when the target is a transaction) else sample
+                        // qty; Chkd = sample qty; Accepted = number of
+                        // accepted samples. Computed via the shared
+                        // ir_header_quantities() helper.
+                        $pdnQty      = $hdrQtys['pdn'];
+                        $chkdQty     = $hdrQtys['chkd'];
+                        $acceptedQty = $hdrQtys['accepted'];
                         ?>
                         <div class="field"><label>PDN qty</label>
-                            <div><strong><?= $pdnQty !== null ? (int)$pdnQty : '—' ?></strong></div>
+                            <div><strong><?= (int)$pdnQty ?></strong></div>
                         </div>
                         <div class="field"><label>Chkd qty</label>
-                            <div><strong><?= $row['chkd_qty'] !== null ? (int)$row['chkd_qty'] : '—' ?></strong></div>
+                            <div><strong><?= (int)$chkdQty ?></strong></div>
                         </div>
                         <div class="field"><label>Accepted qty</label>
-                            <div><strong><?= $acceptedQty !== null ? (int)$acceptedQty : '—' ?></strong></div>
+                            <div><strong><?= (int)$acceptedQty ?></strong></div>
                         </div>
                     </div>
-                    <?php if (!empty($row['part_description'])): ?>
+                    <?php if (!empty($hdrPartDesc)): ?>
                         <div style="margin-top:8px;"><span class="muted small">Description:</span>
-                            <?= h($row['part_description']) ?>
+                            <?= h($hdrPartDesc) ?>
                         </div>
                     <?php endif; ?>
                 </div>
@@ -4719,13 +4748,24 @@ if ($action === 'view') {
                     .ir-view { width: 100%; border-collapse: collapse; font-size: 12px; }
                     .ir-view th, .ir-view td { border: 1px solid var(--border); padding: 4px 6px; text-align: center; vertical-align: middle; }
                     .ir-view thead th { background: #f3f4f6; font-weight: 600; position: sticky; top: 0; z-index: 1; }
-                    .ir-view .col-bbl     { width: 36px;  font-variant-numeric: tabular-nums; }
-                    .ir-view .col-param   { width: 200px; text-align: left; }
+                    .ir-view .col-bbl     { width: 36px; min-width: 36px; max-width: 36px; font-variant-numeric: tabular-nums; }
+                    .ir-view .col-param   { width: 200px; min-width: 200px; text-align: left; }
+                    /* Freeze Bbl + Parameter columns (mirrors the execute grid) so
+                       the balloon number stays visible on wide multi-sample IRs. */
+                    .ir-view .col-bbl,
+                    .ir-view .col-param   { position: sticky; background: #fff; z-index: 2; }
+                    .ir-view .col-bbl     { left: 0; }
+                    .ir-view .col-param   { left: 36px; }
+                    .ir-view thead .col-bbl,
+                    .ir-view thead .col-param { z-index: 3; background: #f3f4f6; }
+                    .ir-view tr.is-note .col-bbl,
+                    .ir-view tr.is-note .col-param { background: #f9fafb; }
                     .ir-view .col-nom     { width: 70px;  font-variant-numeric: tabular-nums; }
                     .ir-view .col-tol     { width: 60px;  font-variant-numeric: tabular-nums; }
                     .ir-view .col-minmax  { width: 80px;  font-variant-numeric: tabular-nums; }
                     .ir-view .col-uom     { width: 44px; }
                     .ir-view .col-instr   { width: 140px; text-align: left; }
+                    .ir-view .col-notes   { width: 140px; text-align: left; }
                     .ir-view .col-sample  { width: 72px;  font-variant-numeric: tabular-nums; }
                     .ir-view tr.is-note td { background: #f9fafb; }
                     .ir-view tr.is-note td.note-span { text-align: left; font-style: italic; }
@@ -4747,10 +4787,11 @@ if ($action === 'view') {
                                 <th class="col-tol">Tol −/+</th>
                                 <th class="col-minmax">Min / Max</th>
                                 <th class="col-uom">UOM</th>
-                                <th class="col-instr">Notes (instrument)</th>
+                                <th class="col-instr">Instrument</th>
                                 <?php for ($s = 1; $s <= $sampleCountView; $s++): ?>
                                     <th class="col-sample">S<?= $s ?></th>
                                 <?php endfor; ?>
+                                <th class="col-notes">Notes</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -4839,13 +4880,19 @@ if ($action === 'view') {
                                             }
                                             if ($cls === 'cell-fail') $sampleFailed[$s] = true;
                                         }
-                                        // For LOGIC type, show pass/fail text as the display value
-                                        $dispVal = ($ctv === 'logic' && $val !== '')
+                                        // Dropdown-verdict types (logic / logical-nom /
+                                        // logical-min-max) store "pass"/"fail" — show it
+                                        // title-cased as the display value.
+                                        $dispVal = (ir_is_select_passfail($ctv) && $val !== '')
                                             ? ucfirst($val) : $val;
                                     ?>
                                         <td class="col-sample <?= h($cls) ?>"><?= h($dispVal) ?></td>
                                     <?php endfor; ?>
                                 <?php endif; ?>
+                                <td class="col-notes"><?php
+                                    $itemNote = (string)($p['item_notes'] ?? '');
+                                    echo $itemNote !== '' ? h($itemNote) : '';
+                                ?></td>
                             </tr>
                         <?php endforeach; ?>
                         </tbody>
@@ -4859,6 +4906,7 @@ if ($action === 'view') {
                                     ?>
                                         <td class="col-sample"><?= h($footerLabel) ?></td>
                                     <?php endfor; ?>
+                                    <td class="col-notes"></td>
                                 </tr>
                             </tfoot>
                         <?php endif; ?>
@@ -4966,7 +5014,8 @@ if ($action === 'download_pdf') {
     require_permission('inspection', 'view');
     $id = (int)input('id', 0);
     require_once __DIR__ . '/includes/_inspection_ir_pdf.php';
-    $att = ir_render_pdf($id);
+    $poNoOverride = trim((string)input('po_no', ''));
+    $att = ir_render_pdf($id, null, ['po_no_override' => $poNoOverride !== '' ? $poNoOverride : null]);
     if (!$att) {
         flash_set('error', 'Inspection not found or could not generate PDF.');
         redirect(url('/inspection.php'));
@@ -5128,13 +5177,26 @@ if ($action === 'execute') {
                     .ir-exec { width: 100%; border-collapse: collapse; font-size: 12px; }
                     .ir-exec th, .ir-exec td { border: 1px solid var(--border); padding: 3px 4px; text-align: center; vertical-align: middle; }
                     .ir-exec thead th { background: #f3f4f6; font-weight: 600; position: sticky; top: 0; z-index: 1; }
-                    .ir-exec .col-bbl    { width: 36px;  font-variant-numeric: tabular-nums; }
-                    .ir-exec .col-param  { width: 200px; text-align: left; }
+                    .ir-exec .col-bbl    { width: 36px; min-width: 36px; max-width: 36px; font-variant-numeric: tabular-nums; }
+                    .ir-exec .col-param  { width: 200px; min-width: 200px; text-align: left; }
+                    /* Freeze the Bbl + Parameter columns so they stay visible while
+                       the inspector scrolls right to reach far sample columns on a
+                       wide multi-sample IR. Without this the balloon number scrolls
+                       out of view the moment you tab into a sample cell to the right. */
+                    .ir-exec .col-bbl,
+                    .ir-exec .col-param  { position: sticky; background: #fff; z-index: 2; }
+                    .ir-exec .col-bbl    { left: 0; }
+                    .ir-exec .col-param  { left: 36px; }
+                    .ir-exec thead .col-bbl,
+                    .ir-exec thead .col-param { z-index: 3; background: #f3f4f6; }
+                    .ir-exec tr.is-note .col-bbl,
+                    .ir-exec tr.is-note .col-param { background: #f9fafb; }
                     .ir-exec .col-nom    { width: 70px;  font-variant-numeric: tabular-nums; }
                     .ir-exec .col-tol    { width: 60px;  font-variant-numeric: tabular-nums; }
                     .ir-exec .col-minmax { width: 80px;  font-variant-numeric: tabular-nums; }
                     .ir-exec .col-uom    { width: 44px; }
                     .ir-exec .col-instr  { width: 140px; text-align: left; }
+                    .ir-exec .col-notes  { width: 140px; text-align: left; }
                     .ir-exec .col-sample { width: 72px; }
                     .ir-exec input       { width: 100%; border: none; background: transparent; font: inherit; padding: 2px 4px; text-align: center; font-variant-numeric: tabular-nums; }
                     .ir-exec input:focus { outline: 1px solid var(--primary); background: #fff; }
@@ -5161,10 +5223,11 @@ if ($action === 'execute') {
                                 <th class="col-tol">Tol −/+</th>
                                 <th class="col-minmax">Min / Max</th>
                                 <th class="col-uom">UOM</th>
-                                <th class="col-instr">Notes (instrument)</th>
+                                <th class="col-instr">Instrument</th>
                                 <?php for ($s = 1; $s <= $sampleCount; $s++): ?>
                                     <th class="col-sample">S<?= $s ?></th>
                                 <?php endfor; ?>
+                                <th class="col-notes">Notes</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -5172,7 +5235,7 @@ if ($action === 'execute') {
                             $tid  = (int)$p['template_item_id'];
                             $ct   = (string)($p['check_type'] ?? '');
                             $isNote = ($ct === 'text' || $ct === 'notes');
-                            $isLogic = ($ct === 'logic');
+                            $isSelectPF = ir_is_select_passfail($ct);
                             $bub  = $p['bubble_no'] ?? '';
                             $gdt  = $p['gdt_symbol'] ?? '';
                             list($minV, $maxV) = ir_min_max_for_type(
@@ -5225,7 +5288,11 @@ if ($action === 'execute') {
                                 <?php else:
                                     $isMinMax = ($ct === 'min-max' || $ct === 'logical-min-max');
                                     $noSpec   = ($ct === 'logic' || $ct === 'boolean' || $ct === 'visual');
-                                    $autoLive = ($ct === 'logical-nom' || $ct === 'logical-min-max' || $ct === 'numeric');
+                                    // Live colour-as-you-type only for numeric readings that
+                                    // auto-evaluate. nom / min-max also auto-evaluate but the
+                                    // verdict is shown on the view/report (not live). The
+                                    // logical-* types now use the Pass/Fail dropdown below.
+                                    $autoLive = ($ct === 'numeric');
                                 ?>
                                     <?php if ($noSpec): ?>
                                         <td class="col-nom muted">—</td>
@@ -5258,7 +5325,7 @@ if ($action === 'execute') {
                                     ?>
                                         <td class="col-sample">
                                             <?php if ($rid): ?>
-                                                <?php if ($isLogic): ?>
+                                                <?php if ($isSelectPF): ?>
                                                     <select name="result_value[<?= $rid ?>]" class="no-combobox logic-sel">
                                                         <option value="">—</option>
                                                         <option value="pass" <?= $val==='pass'?'selected':'' ?>>Pass</option>
@@ -5283,6 +5350,10 @@ if ($action === 'execute') {
                                         </td>
                                     <?php endfor; ?>
                                 <?php endif; ?>
+                                <td class="col-notes"><?php
+                                    $itemNote = (string)($p['item_notes'] ?? '');
+                                    echo $itemNote !== '' ? h($itemNote) : '';
+                                ?></td>
                             </tr>
                         <?php endforeach; ?>
                         </tbody>
@@ -5297,6 +5368,7 @@ if ($action === 'execute') {
                                                placeholder="Accepted">
                                     </td>
                                 <?php endfor; ?>
+                                <td class="col-notes"></td>
                             </tr>
                         </tfoot>
                     </table>

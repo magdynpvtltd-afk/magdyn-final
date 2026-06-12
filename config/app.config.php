@@ -15,7 +15,7 @@ return [
     // The path under your web root the app lives at (no trailing slash).
     // If you serve it at https://example.com/magdyn use '/magdyn'.
     // If you serve it at the document root, use ''.
-    'base_url'    => '/magdyn',
+    'base_url'    => '/magdyn-Final/magdyn',
 
     // ---- Locale ----
     'timezone'    => 'Asia/Kolkata',

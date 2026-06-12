@@ -328,6 +328,7 @@ if ($action === 'all_shipments_with_lines_json') {
             -- custom_field_id 9, 'S_Order No'). Drives the system PO number and
             -- the combine-by-order grouping on import.
             scf.cfv_9                           AS s_order_no,
+            it.inventory_transaction_id         AS line_inv_txn_id,
             im.inventory_model_id               AS item_model_id,
             im.inventory_model_code             AS item_code,
             im.short_description                AS item_name,
@@ -386,6 +387,11 @@ if ($action === 'all_shipments_with_lines_json') {
         // Only add a line when an inventory_transaction row was joined
         if ($row['item_model_id'] !== null && $row['item_model_id'] !== '') {
             $shipments[$shipmentIdx[$sid]]['lines'][] = array(
+                // Per-line inventory_transaction.inventory_transaction_id. This is
+                // the id invoices (recp_inv.trans_id) actually point at, so it
+                // becomes the line's old_transaction_id on import (NOT the
+                // shipment header's transaction_id, which is the `transaction` PK).
+                'inventory_transaction_id' => $row['line_inv_txn_id'],
                 'item_model_id' => $row['item_model_id'],   // numeric id — BOM import uses this as inv_items.code
                 'item_code'     => $row['item_code'],        // inventory_model_code (alphanumeric barcode)
                 'item_name'     => $row['item_name'],
@@ -455,6 +461,7 @@ if ($action === 'all_receipts_with_lines_json') {
             -- custom_field_id 9, 'S_Order No'). Drives the system PO number and
             -- the combine-by-order grouping on import.
             rcf.cfv_9                   AS s_order_no,
+            it.inventory_transaction_id AS line_inv_txn_id,
             im.inventory_model_id       AS item_model_id,
             im.inventory_model_code     AS item_code,
             im.short_description        AS item_name,
@@ -506,6 +513,11 @@ if ($action === 'all_receipts_with_lines_json') {
         }
         if ($row['item_model_id'] !== null && $row['item_model_id'] !== '') {
             $receipts[$receiptIdx[$rid]]['lines'][] = array(
+                // Per-line inventory_transaction.inventory_transaction_id — the id
+                // invoices (recp_inv.trans_id) point at, used as the line's
+                // old_transaction_id on import (NOT the receipt header's
+                // transaction_id, which is the `transaction` PK).
+                'inventory_transaction_id' => $row['line_inv_txn_id'],
                 'item_model_id' => $row['item_model_id'],   // numeric id — BOM import uses this as inv_items.code
                 'item_code'     => $row['item_code'],        // inventory_model_code (alphanumeric barcode)
                 'item_name'     => $row['item_name'],

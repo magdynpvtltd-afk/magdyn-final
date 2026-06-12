@@ -634,6 +634,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'import
                         $modelId = (string)($line['item_model_id'] ?? '');
                         $code    = (string)($line['item_code']    ?? '');
                         $itemId  = old_inv_ensure_item($modelId, $code, (string)($line['item_name'] ?? ''));
+                        // Per-line linkage id: the old inventory_transaction.
+                        // inventory_transaction_id (joined from the shipment's
+                        // transaction_id), NOT the shipment header transaction_id.
+                        // Invoices (recp_inv.trans_id) point at this id, so it's
+                        // what the invoice import matches old_transaction_id on.
+                        $lineTxnId = (int)($line['inventory_transaction_id'] ?? 0);
                         // For a shipped shipment, record qty_shipped = qty_planned
                         // so the line surfaces as a ship-out EVENT (dated by
                         // actual_ship_date = event date) in the shipment list.
@@ -649,7 +655,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'import
                                 $itemId ? null : ($line['item_name'] ?: ($code ?: 'Unknown')),
                                 $qty,
                                 $shipped ? $qty : 0,
-                                $oldTxnId ?: null,
+                                $lineTxnId ?: null,
                             ]
                         );
                     }
@@ -770,6 +776,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'import
                         $modelId = (string)($line['item_model_id'] ?? '');
                         $code    = (string)($line['item_code']    ?? '');
                         $itemId  = old_inv_ensure_item($modelId, $code, (string)($line['item_name'] ?? ''));
+                        // Per-line linkage id: the old inventory_transaction.
+                        // inventory_transaction_id (joined from the receipt's
+                        // transaction_id), NOT the receipt header transaction_id.
+                        // Invoices (recp_inv.trans_id) point at this id, so it's
+                        // what the invoice import matches old_transaction_id on.
+                        $lineTxnId = (int)($line['inventory_transaction_id'] ?? 0);
                         // Actual received qty goes into qty_received for closed receipts
                         db_exec(
                             'INSERT INTO inv_shipment_lines
@@ -784,7 +796,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'import
                                 $qty,
                                 $received ? $qty : 0,
                                 $rcptDate,
-                                $oldTxnId ?: null,
+                                $lineTxnId ?: null,
                             ]
                         );
                     }

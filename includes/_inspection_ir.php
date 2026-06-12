@@ -228,10 +228,16 @@ function ir_seed_results_with_samples($inspectionId, $templateId, $sampleCount)
  */
 function ir_results_grid($inspectionId)
 {
+    // LEFT JOIN the template item so each result row also carries the
+    // template's free-text `notes` (aliased item_notes — kept distinct from
+    // inspection_results.notes, the per-result inspector note). Surfaced in
+    // the inspection View / Execute grid and the printed/PDF IR.
     $rows = db_all(
-        'SELECT * FROM inspection_results
-          WHERE inspection_id = ?
-          ORDER BY sort_order, template_item_id, sample_no',
+        'SELECT ir.*, iti.notes AS item_notes
+           FROM inspection_results ir
+           LEFT JOIN inspection_template_items iti ON iti.id = ir.template_item_id
+          WHERE ir.inspection_id = ?
+          ORDER BY ir.sort_order, ir.template_item_id, ir.sample_no',
         [(int)$inspectionId]
     );
     $grid = [];
@@ -313,12 +319,28 @@ function ir_min_max_for_type($checkType, $target, $lower, $upper)
 
 
 /**
- * Whether a check type auto-computes pass/fail from the measured value.
+ * Whether a check type auto-computes pass/fail from a NUMERIC measured
+ * value against its [min, max] spec (numeric / nom / min-max). The
+ * inspector types a reading and the verdict is derived from the bounds.
  * Types that return false require a manual verdict (or have no verdict).
  */
 function ir_auto_passfail($checkType)
 {
-    return in_array($checkType, ['numeric', 'logical-nom', 'logical-min-max'], true);
+    return in_array($checkType, ['numeric', 'nom', 'min-max'], true);
+}
+
+
+/**
+ * Whether a check type records its verdict via a manual Pass/Fail
+ * dropdown (logic / logical-nom / logical-min-max). The verdict itself
+ * is stored verbatim ("pass"/"fail") in measured_value. The logical-*
+ * types still carry a nominal ± tol / min-max spec that is DISPLAYED in
+ * the entry header, the view grid and the printed report — the operator
+ * just decides pass/fail rather than typing a measurement.
+ */
+function ir_is_select_passfail($checkType)
+{
+    return in_array($checkType, ['logic', 'logical-nom', 'logical-min-max'], true);
 }
 
 
@@ -330,6 +352,132 @@ function ir_fmt_num($v)
     if ($v === null || $v === '') return '';
     if (!is_numeric($v)) return (string)$v;
     return rtrim(rtrim(number_format((float)$v, 4, '.', ''), '0'), '.');
+}
+
+
+/**
+ * Resolve the inv_item that an inspection actually targets, plus the
+ * transaction quantity when the target is an inventory transaction.
+ *
+ * The IR header takes Part No / Part Rev / Part Desc from the *live*
+ * inspected item (not the creation-time snapshot, which may be blank
+ * for txn-targeted or legacy inspections). The item is reached either
+ * directly (entity_type = 'inv_item') or through the transaction's
+ * item_id (entity_type = 'inv_txn').
+ *
+ * Returns:
+ *   ['item' => array|null, 'txn_qty' => float|null]
+ * where `item` carries part_no, part_rev_no, name, code, dwg_no,
+ * dwg_rev_no, and `txn_qty` is the magnitude of the txn's qty_delta
+ * (NULL when the target isn't a transaction).
+ */
+function ir_resolve_inspected_item($row)
+{
+    $entityType = (string)($row['entity_type'] ?? 'none');
+    $entityId   = (int)($row['entity_id'] ?? 0);
+    $itemId     = null;
+    $txnQty     = null;
+
+    if ($entityType === 'inv_item' && $entityId) {
+        $itemId = $entityId;
+    } elseif ($entityType === 'inv_txn' && $entityId) {
+        $txn = db_one('SELECT item_id, qty_delta FROM inv_txns WHERE id = ?', [$entityId]);
+        if ($txn) {
+            $itemId = (int)$txn['item_id'];
+            $txnQty = abs((float)$txn['qty_delta']);
+        }
+    }
+
+    $item = null;
+    if ($itemId) {
+        $item = db_one(
+            'SELECT part_no, part_rev_no, name, code, dwg_no, dwg_rev_no
+               FROM inv_items WHERE id = ?',
+            [$itemId]
+        );
+    }
+
+    return ['item' => $item, 'txn_qty' => $txnQty];
+}
+
+
+/**
+ * Per-sample acceptance map for an IR results grid.
+ *
+ * A sample column is "Accepted" when it carries at least one measured
+ * value AND none of its readings fail their spec. Mirrors the per-page
+ * Remarks-row logic in the printed IR so the on-screen view, the
+ * printed report and the Accepted-qty figure all agree.
+ *
+ * Returns [sampleNo => bool] for sampleNo 1..$sampleCount.
+ */
+function ir_sample_accept_map($params, $grid, $sampleCount)
+{
+    $sampleCount = max(1, (int)$sampleCount);
+    $hasValue = [];
+    $failed   = [];
+    for ($s = 1; $s <= $sampleCount; $s++) {
+        $hasValue[$s] = false;
+        $failed[$s]   = false;
+    }
+
+    foreach ($params as $p) {
+        $ct  = strtolower((string)($p['check_type'] ?? 'numeric'));
+        $tid = (int)$p['template_item_id'];
+        list($minV, $maxV) = ir_min_max_for_type(
+            $ct,
+            $p['target_value']    ?? null,
+            $p['tolerance_lower'] ?? null,
+            $p['tolerance_upper'] ?? null
+        );
+        for ($s = 1; $s <= $sampleCount; $s++) {
+            $cell = $grid[$tid][$s] ?? null;
+            if (!$cell) continue;
+            $val = (string)($cell['measured_value'] ?? '');
+            if ($val === '') continue;
+            $hasValue[$s] = true;
+            if (is_numeric($val) && ($minV !== null || $maxV !== null)) {
+                $v = (float)$val;
+                if (($minV !== null && $v < (float)$minV) ||
+                    ($maxV !== null && $v > (float)$maxV)) {
+                    $failed[$s] = true;
+                }
+            } elseif (($cell['pass_fail'] ?? '') === 'fail') {
+                $failed[$s] = true;
+            }
+        }
+    }
+
+    $map = [];
+    for ($s = 1; $s <= $sampleCount; $s++) {
+        $map[$s] = ($hasValue[$s] && !$failed[$s]);
+    }
+    return $map;
+}
+
+
+/**
+ * Derive the IR header quantity figures from an inspection row + its
+ * results grid, per the confirmed business rules:
+ *
+ *   PDN qty      = transaction quantity when the inspection targets an
+ *                  inv_txn, otherwise the sample count (= sample qty).
+ *   Chkd qty     = sample count (number of sample columns inspected).
+ *   Accepted qty = number of sample columns marked Accepted.
+ *
+ * Returns ['pdn' => int, 'chkd' => int, 'accepted' => int].
+ */
+function ir_header_quantities($row, $params, $grid)
+{
+    $sampleCount = max(1, (int)($row['sample_count'] ?? 1));
+    $resolved    = ir_resolve_inspected_item($row);
+    $txnQty      = $resolved['txn_qty'];
+
+    $pdn      = ($txnQty !== null) ? (int)round($txnQty) : $sampleCount;
+    $chkd     = $sampleCount;
+    $accepted = count(array_filter(ir_sample_accept_map($params, $grid, $sampleCount)));
+
+    return ['pdn' => $pdn, 'chkd' => $chkd, 'accepted' => $accepted];
 }
 
 
