@@ -402,9 +402,31 @@ if ($action === 'txn_process') {
     try {
         db()->beginTransaction();
 
+        // Resolve done_by employee IDs (users_info) + names up-front. The
+        // names are stamped into the header note ("Process done by …") as
+        // well as persisted to inv_txn_done_by below. Reads the multi-select
+        // POST `done_by[]`; unknown / duplicate IDs are silently dropped.
+        $doneByRaw = isset($_POST['done_by']) ? (array)$_POST['done_by'] : [];
+        $doneBy    = array_values(array_unique(array_filter(array_map('intval', $doneByRaw))));
+        $doneByNames = [];
+        if ($doneBy) {
+            $ph   = implode(',', array_fill(0, count($doneBy), '?'));
+            $rows = db_all("SELECT id, name FROM users_info WHERE id IN ($ph)", $doneBy);
+            $nameById = [];
+            foreach ($rows as $r) $nameById[(int)$r['id']] = $r['name'];
+            // Preserve the order the user picked them in.
+            foreach ($doneBy as $eid) {
+                if (isset($nameById[$eid])) $doneByNames[] = $nameById[$eid];
+            }
+        }
+
         // 1. Increment the produced item at the DESTINATION location.
-        $headerNote = $notes;
-        if (!$headerNote) {
+        //    Header note = "Process done by <names>" + the user's notes.
+        $noteParts = [];
+        if ($doneByNames) $noteParts[] = 'Process done by ' . implode(', ', $doneByNames);
+        if ($notes)       $noteParts[] = $notes;
+        $headerNote = implode(' — ', $noteParts);
+        if ($headerNote === '') {
             if ($directAddition) {
                 $headerNote = 'Direct addition: ' . $qty . ' x ' . $product['code'];
             } elseif ($reworkFlag) {
@@ -421,11 +443,7 @@ if ($action === 'txn_process') {
             null, $refDoc, $headerNote
         );
 
-        // Persist done_by: zero or more user IDs attached to the header
-        // txn. Reads from the multi-select POST `done_by[]`. Silently
-        // ignores duplicates and unknown IDs (FK + PK enforce sanity).
-        $doneByRaw = isset($_POST['done_by']) ? (array)$_POST['done_by'] : [];
-        $doneBy    = array_values(array_unique(array_filter(array_map('intval', $doneByRaw))));
+        // Persist done_by rows (PK on (txn_id, user_id) dedupes).
         foreach ($doneBy as $uid) {
             db_exec(
                 'INSERT IGNORE INTO inv_txn_done_by (txn_id, user_id) VALUES (?, ?)',
@@ -845,15 +863,15 @@ if ($action === 'process') {
         $locsForJs[] = ['id' => (int)$l['id'], 'name' => $l['name'], 'code' => $l['code']];
     }
 
-    // Active users for the "Done by" multi-select. Includes the current
-    // user pre-selected so the common one-person case requires no clicks.
+    // Active employees (users_info) for the "Done by" multi-select. These
+    // are shop-floor / staff names (not login accounts), managed under
+    // Admin ▸ Employees. status = 1 means active.
     $activeUsers = db_all(
-        "SELECT id, full_name, email
-           FROM users
-          WHERE is_active = 1
-          ORDER BY full_name, email"
+        "SELECT id, name
+           FROM users_info
+          WHERE status = 1
+          ORDER BY name"
     );
-    $currentUid = current_user_id();
 
     $page_title  = 'Process inventory';
     $page_module = 'inventory_process';
@@ -922,16 +940,14 @@ if ($action === 'process') {
                     <div class="field">
                         <label for="f_done_by">Done by</label>
                         <select id="f_done_by" name="done_by[]" multiple class="chips" tabindex="6"
-                                data-placeholder="Pick one or more users…">
-                            <?php foreach ($activeUsers as $u):
-                                $sel = (int)$u['id'] === (int)$currentUid;
-                            ?>
-                                <option value="<?= (int)$u['id'] ?>" <?= $sel ? 'selected' : '' ?>>
-                                    <?= h($u['full_name'] ?: $u['email']) ?>
+                                data-placeholder="Pick one or more employees…">
+                            <?php foreach ($activeUsers as $u): ?>
+                                <option value="<?= (int)$u['id'] ?>">
+                                    <?= h($u['name']) ?>
                                 </option>
                             <?php endforeach; ?>
                         </select>
-                        <span class="muted small">Logged-in user is pre-selected. Add others as needed.</span>
+                        <span class="muted small">Pick the employee(s) who performed this process. Manage the list under Admin ▸ Employees.</span>
                     </div>
 
                     <div class="field">
