@@ -269,6 +269,35 @@
             }
         });
 
+        // ---- Clear all filters ----
+        // Resets every per-column filter (server + client + selects) and the
+        // global search box, then reloads to an unfiltered first page. Sort
+        // and page size are intentionally preserved. The cleared state is
+        // persisted so the table comes back clean on the next visit.
+        var clearBtn = wrap.querySelector('.dt-clear-filters');
+        if (clearBtn) {
+            clearBtn.addEventListener('click', function () {
+                var changed = false;
+                wrap.querySelectorAll('.dt-col-filter').forEach(function (inp) {
+                    if (inp.tagName === 'SELECT') {
+                        if (inp.selectedIndex !== 0) { inp.selectedIndex = 0; changed = true; }
+                    } else if (inp.value !== '') {
+                        inp.value = '';
+                        changed = true;
+                    }
+                });
+                var qBox = wrap.querySelector('.dt-q');
+                if (qBox && qBox.value !== '') { qBox.value = ''; changed = true; }
+                // Always un-hide any client-side-filtered rows.
+                applyClientFilters(wrap);
+                // Reload the server-side view (drops dt_q + dt_col[*] params).
+                var s = readState(wrap);
+                s.page = 1;
+                reload(wrap, s, true);
+                saveView(wrap);
+            });
+        }
+
         // Apply any restored client-side filters once on load. The server
         // pre-populates these inputs' values from the saved view; this hides
         // the non-matching rows so the initial paint matches the saved state.

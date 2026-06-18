@@ -255,3 +255,87 @@
     if (document.readyState !== 'loading') syncOnLoad();
     else document.addEventListener('DOMContentLoaded', syncOnLoad);
 })();
+
+/* ============================================================
+   Prevent double form submission.
+   Guards every mutating (non-GET) form against a second submit
+   caused by a double-click, Enter-key spam, or an impatient
+   user. Implemented once at the document level so it covers all
+   ~200 forms without touching each page, and survives SPA
+   content swaps (the listener lives on document, which never
+   gets replaced).
+
+   How it works:
+   - A submit is allowed through only when the form isn't already
+     marked in-flight; the next submit while in-flight is dropped.
+   - The actual button-disable is deferred to a macrotask tick so
+     that (a) the activating button's name/value is still
+     serialized into the request, and (b) we can inspect
+     e.defaultPrevented to tell a real navigation apart from an
+     AJAX/validation submit that keeps the page in place.
+       * defaultPrevented (AJAX, e.g. cmm.js, or canceled submit)
+         -> release the guard; the page-level handler owns its
+         own re-submit protection and the page won't reload.
+       * not prevented (normal POST -> full page reload)
+         -> disable the submit controls; the reload resets state.
+
+   Opt out per-form with data-allow-resubmit.
+   ============================================================ */
+(function () {
+    function isGet(form) {
+        return (form.getAttribute('method') || 'get').toLowerCase() === 'get';
+    }
+    function submitControls(form) {
+        return form.querySelectorAll(
+            'button[type="submit"], button:not([type]), ' +
+            'input[type="submit"], input[type="image"]'
+        );
+    }
+    function lock(b) {
+        b.disabled = true;
+        b.setAttribute('aria-disabled', 'true');
+        b.classList.add('is-submitting');
+    }
+    function unlock(b) {
+        b.disabled = false;
+        b.removeAttribute('aria-disabled');
+        b.classList.remove('is-submitting');
+    }
+
+    document.addEventListener('submit', function (e) {
+        var form = e.target;
+        if (!form || form.tagName !== 'FORM') return;
+        // GET forms are search/filter navigation (handled by spa.js);
+        // re-running them is harmless, so leave them alone.
+        if (isGet(form)) return;
+        if (form.hasAttribute('data-allow-resubmit')) return;
+
+        // Already submitting -> block the duplicate outright. Stop other
+        // listeners too so an AJAX handler doesn't fire a second request.
+        if (form.dataset.submitting === '1') {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            return;
+        }
+        form.dataset.submitting = '1';
+
+        setTimeout(function () {
+            if (e.defaultPrevented) {
+                // No navigation happened (AJAX / validation / canceled).
+                form.dataset.submitting = '';
+                return;
+            }
+            submitControls(form).forEach(lock);
+        }, 0);
+    });
+
+    // Restore controls when a page is served from the bfcache (Back/Forward),
+    // which would otherwise show the form with its buttons still disabled.
+    window.addEventListener('pageshow', function (e) {
+        if (!e.persisted) return;
+        document.querySelectorAll('.is-submitting').forEach(unlock);
+        document.querySelectorAll('form').forEach(function (f) {
+            if (f.dataset.submitting) f.dataset.submitting = '';
+        });
+    });
+})();

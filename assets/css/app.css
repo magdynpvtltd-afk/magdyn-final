@@ -2168,6 +2168,44 @@ body[data-chord-first] .sidebar .nav-item u {
    the full text on hover regardless. */
 .dt-table tbody td > * { vertical-align: middle; }
 
+/* ---- Grid border lines + left-aligned cells (all datatables) ----
+   Created: 20260618_IST
+   Two related rules requested across every list-page datatable:
+     1. Show a full grid — the base only paints horizontal rules
+        (border-bottom). Add vertical rules (border-right per cell) so
+        header, body, and filter rows all read as a bordered grid.
+     2. Force header AND value cells left-aligned, so each value's text
+        alignment matches its column header (headers are always left).
+   Scoped to .dt-table so special tables (perm-matrix, bom-grid, …)
+   keep their own alignment. The .dt-scroll wrapper already paints the
+   outer border, so the rightmost column drops its right rule to avoid
+   a doubled line. */
+.dt-table thead th,
+.dt-table tbody td,
+.dt-table tfoot td.dt-filter-td {
+    border-right: 1px solid var(--border);
+}
+.dt-table thead th:last-child,
+.dt-table tbody td:last-child,
+.dt-table tfoot td.dt-filter-td:last-child {
+    border-right: none;
+}
+/* Base removes the final row's bottom rule; re-instate it so the grid
+   reads consistently down to the last data row. */
+.dt-table tbody tr:last-child td { border-bottom: 1px solid var(--border); }
+
+/* Value alignment matches the (always left-aligned) header. The td.r /
+   td.c selectors out-specify the .data-table .r / .c base rules that
+   would otherwise right/center-align numeric and centered columns. The
+   Actions column keeps its own right alignment (higher-specificity
+   :has(.dt-actions) rule below). */
+.dt-table thead th,
+.dt-table tbody td,
+.dt-table tbody td.r,
+.dt-table tbody td.c {
+    text-align: left;
+}
+
 /* ============================================================
    FORM PAGES — denser layout for long forms
    Created: 20260516_131500_IST

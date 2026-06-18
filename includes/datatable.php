@@ -422,6 +422,26 @@ function data_table_render(array $cfg, array $dt, callable $rowRenderer)
                         ⚙ Columns
                     </button>
                 <?php endif; ?>
+                <?php
+                    // "Clear filters" — shown whenever the table has at least one
+                    // filterable column (same rule the filter row uses below). It
+                    // resets every per-column filter, the global search, and any
+                    // client-side row filter, then reloads to an unfiltered view.
+                    $hasAnyFilter = false;
+                    foreach ($cols as $c) {
+                        if (isset($c['filterable']) && $c['filterable'] === false) continue;
+                        if (strncmp((string)$c['key'], '_', 1) === 0) continue;
+                        $hasAnyFilter = true;
+                        break;
+                    }
+                    if ($hasAnyFilter):
+                ?>
+                    <button type="button" class="btn btn-sm btn-ghost dt-clear-filters"
+                            data-dt-clear-filters
+                            title="Clear all column filters and the search box for this table.">
+                        ✕ Clear filters
+                    </button>
+                <?php endif; ?>
             </div>
             <?php if ($title): ?>
                 <h2 class="dt-toolbar-title"><?= h($title) ?></h2>

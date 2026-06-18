@@ -108,7 +108,7 @@ function shr_recompute_line_received($lineId)
 function shr_item_picker_options()
 {
     return db_all(
-        'SELECT id, code,
+        'SELECT id, code, uom_id,
                 CONCAT(code, " — ", COALESCE(NULLIF(short_description, ""), name)) AS label,
                 uom
            FROM inv_items
@@ -1789,7 +1789,8 @@ if ($action === 'receive_save') {
                 'INSERT INTO inv_items (code, name, uom_id, is_active)
                   VALUES (?, ?, ?, 1)',
                 [$newCode, (string)$line['pending_name'],
-                 !empty($line['pending_uom_id']) ? (int)$line['pending_uom_id'] : null]
+                 !empty($line['pending_uom_id']) ? (int)$line['pending_uom_id']
+                     : (!empty($line['uom_id']) ? (int)$line['uom_id'] : null)]
             );
             $newItemId = (int)db()->lastInsertId();
             db_exec(
@@ -2538,6 +2539,7 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
                                 <option value="">— pick an item —</option>
                                 <?php foreach ($itemOpts as $opt): ?>
                                     <option value="<?= (int)$opt['id'] ?>"
+                                            data-uom-id="<?= (int)($opt['uom_id'] ?? 0) ?>"
                                             <?= (int)$opt['id'] === $lItemId ? 'selected' : '' ?>>
                                         <?= h($opt['label']) ?>
                                     </option>
@@ -2559,21 +2561,11 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
                         </span>
 
                         <span class="shr-slot shr-slot-pending"
-                              style="<?= $lSubType === 'pending' ? 'display:flex;' : 'display:none;' ?> gap: 6px;">
+                              style="<?= $lSubType === 'pending' ? '' : 'display:none;' ?>">
                             <input type="text" name="line_pending_name[]" maxlength="190"
                                    class="shr-line-pending"
                                    placeholder="Name of new item (created on receipt)"
-                                   value="<?= h($lPending) ?>" style="flex: 1;">
-                            <select name="line_pending_uom_id[]" class="no-combobox shr-line-pending-uom"
-                                    style="flex: 0 0 110px;">
-                                <option value="">UOM</option>
-                                <?php foreach ($allUoms as $U): ?>
-                                    <option value="<?= (int)$U['id'] ?>"
-                                            <?= (int)$U['id'] === $lPendUom ? 'selected' : '' ?>>
-                                        <?= h($U['code']) ?>
-                                    </option>
-                                <?php endforeach; ?>
-                            </select>
+                                   value="<?= h($lPending) ?>" style="width: 100%;">
                         </span>
                     </td>
                     <td class="r">
@@ -2904,6 +2896,18 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
                 itemEl.addEventListener('change', function () {
                     writeSrcEntries(row, []);   // entries from the old item no longer apply
                     refreshRowSource(row);
+                });
+            }
+            // Auto-fill the line UOM column from the chosen item's default UOM
+            // (ship + receive rows). Only on user change, so a saved line's
+            // own UOM is preserved on page load.
+            if (itemEl) {
+                var uomEl = row.querySelector('.shr-line-uom');
+                itemEl.addEventListener('change', function () {
+                    if (!uomEl) return;
+                    var opt = itemEl.options[itemEl.selectedIndex];
+                    var uid = opt ? (opt.getAttribute('data-uom-id') || '') : '';
+                    if (uid && uid !== '0') uomEl.value = uid;
                 });
             }
             var qtyEl = row.querySelector('input[name="line_qty[]"]');
