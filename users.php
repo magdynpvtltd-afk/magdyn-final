@@ -51,7 +51,12 @@ if ($action === 'save') {
     if ($clash) $errors[] = 'Another user with that username or email already exists.';
 
     if (!$id && $password === '') $errors[] = 'Password is required for new users.';
-    if ($password !== '' && strlen($password) < 8) $errors[] = 'Password must be at least 8 characters.';
+    // Enforce a strong-password policy whenever a password is being set.
+    if ($password !== '') {
+        foreach (password_strength_errors($password, ['username' => $username, 'email' => $email]) as $e) {
+            $errors[] = $e;
+        }
+    }
 
     if ($errors) {
         foreach ($errors as $e) flash_set('error', $e);
@@ -219,6 +224,10 @@ if ($action === 'new' || $action === 'edit') {
                     </label>
                     <input id="f_password" name="password" type="password" tabindex="4"
                            autocomplete="new-password" <?= $editing ? '' : 'required' ?>>
+                    <span class="muted small">
+                        At least 10 characters with an uppercase letter, a lowercase letter,
+                        a number, and a symbol. Must not contain the username or email.
+                    </span>
                 </div>
                 <div class="field span-2">
                     <label>Roles</label>

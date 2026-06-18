@@ -36,8 +36,10 @@
  *                            link can be attached once receipts are generated.
  *   qty/unit_price/gst/uom/hsn_code → copied onto the invoice line.
  *
- * Re-running this import does NOT de-duplicate — run "Delete All Invoices"
- * first for a clean re-import (mirrors the running-notes importer).
+ * Re-running this import is an UPSERT: an invoice already present (matched by
+ * its natural identity — base invoice_no + vendor + financial year) is updated
+ * in place (header refreshed, line items replaced); anything new is created.
+ * Use "Delete All Invoices" only when you want a from-scratch reload.
  *
  * Usage:
  *   require_once __DIR__ . '/../services/OldInventoryInvoiceImportService.php';
@@ -85,6 +87,16 @@ class OldInventoryInvoiceImportService
     /** @var array<string,bool>  invoice_no values already taken (DB + this run) */
     private array $usedNos = [];
 
+    /**
+     * Natural-identity → invoice_id for already-imported (or matching)
+     * invoices, so a re-run UPDATES in place instead of creating duplicates.
+     * Key is lower(base invoice_no) | vendor_id | fy  — see importIdentity().
+     * Seeded from the DB up front and kept current as new rows are inserted.
+     *
+     * @var array<string,int>
+     */
+    private array $existingByIdentity = [];
+
     /** @var array  Accumulated log entries */
     private array $errors = [];
 
@@ -95,6 +107,7 @@ class OldInventoryInvoiceImportService
     private array $counts = [
         'row_total'         => 0,   // source line rows seen
         'inv_created'       => 0,   // invoice headers created
+        'inv_updated'       => 0,   // existing invoice headers updated in place
         'inv_pending'       => 0,
         'inv_approved'      => 0,
         'inv_skipped'       => 0,   // groups skipped (no vendor)
@@ -152,7 +165,7 @@ class OldInventoryInvoiceImportService
         }
 
         $this->log(
-            "Done — Invoices: {$this->counts['inv_created']} " .
+            "Done — Invoices created: {$this->counts['inv_created']}, updated: {$this->counts['inv_updated']} " .
             "(pending: {$this->counts['inv_pending']}, approved: {$this->counts['inv_approved']}, " .
             "skipped no-vendor: {$this->counts['inv_skipped']}). " .
             "Items: {$this->counts['item_created']} " .
@@ -238,40 +251,93 @@ class OldInventoryInvoiceImportService
             return;
         }
 
-        $rows      = $g['rows'];
-        $first     = $rows[0];
-        $invDate   = $this->normalizeDate((string)($first['inv_date'] ?? ''));
-        $invoiceNo = $this->uniqueInvoiceNo((string)$g['inv_no']);
+        $rows    = $g['rows'];
+        $first   = $rows[0];
+        $invDate = $this->normalizeDate((string)($first['inv_date'] ?? ''));
 
-        $noteParts = [];
-        $noteParts[] = 'Imported from old ' . $g['src'] . '.';
-        if (($g['fy'] ?? '') !== '')                 { $noteParts[] = 'FY ' . $g['fy'] . '.'; }
-        if (trim((string)($first['department'] ?? '')) !== '') { $noteParts[] = 'Dept: ' . trim((string)$first['department']) . '.'; }
-        if (trim((string)($first['refno'] ?? '')) !== '')     { $noteParts[] = 'Ref/voucher: ' . trim((string)$first['refno']) . '.'; }
-        if (trim((string)($first['ledger'] ?? '')) !== '')    { $noteParts[] = 'Ledger: ' . trim((string)$first['ledger']) . '.'; }
-        $headerNotes = implode(' ', $noteParts);
+        // Adopt the legacy reference number verbatim. '0' / blank are the
+        // old system's "no ref" placeholders → store NULL.
+        $refno = trim((string)($first['refno'] ?? ''));
+        if ($refno === '' || $refno === '0') { $refno = null; }
+        else { $refno = substr($refno, 0, 32); }
+
+        // FY + Department now land in dedicated columns (invoices.fy / .dept)
+        // instead of being stuffed into the notes blob. Ledger is per-line
+        // (set in importLine). Both are taken verbatim from the legacy row —
+        // '0' / blank are the old system's "unset" placeholders → NULL.
+        $fy   = trim((string)($g['fy'] ?? ''));
+        $fy   = ($fy === '' || $fy === '0') ? null : substr($fy, 0, 16);
+        $dept = trim((string)($first['department'] ?? ''));
+        $dept = ($dept === '' || $dept === '0') ? null : substr($dept, 0, 64);
+
+        $headerNotes = 'Imported from old ' . $g['src'] . '.';
+
+        // Upsert: does an invoice with this natural identity already exist
+        // (from a prior run, the other source table, or an earlier group in
+        // THIS run)? If so update it in place; otherwise create a fresh one.
+        $identity   = $this->importIdentity((string)$g['inv_no'], $vendorId, (string)($g['fy'] ?? ''));
+        $existingId = $this->existingByIdentity[$identity] ?? 0;
+        $isUpdate   = $existingId > 0;
 
         $pdo = db();
         $pdo->beginTransaction();
         try {
-            if ($status === 'approved') {
+            if ($isUpdate) {
+                $invoiceId = $existingId;
+                // Refresh the header from the latest source values. Keep the
+                // stored invoice_no as-is (it's the matched row's number).
+                if ($status === 'approved') {
+                    db_exec(
+                        'UPDATE invoices
+                            SET refno = ?, invoice_date = ?, vendor_id = ?, currency = ?,
+                                status = ?, notes = ?, fy = ?, dept = ?,
+                                approved_by = ?, approved_at = NOW(), rejection_reason = NULL
+                          WHERE id = ?',
+                        [$refno, $invDate, $vendorId, 'INR', 'approved', $headerNotes, $fy, $dept,
+                         $this->actorId, $invoiceId]
+                    );
+                } else {
+                    db_exec(
+                        'UPDATE invoices
+                            SET refno = ?, invoice_date = ?, vendor_id = ?, currency = ?,
+                                status = ?, notes = ?, fy = ?, dept = ?,
+                                approved_by = NULL, approved_at = NULL, rejection_reason = NULL
+                          WHERE id = ?',
+                        [$refno, $invDate, $vendorId, 'INR', 'pending', $headerNotes, $fy, $dept, $invoiceId]
+                    );
+                }
+                // Replace the line items wholesale (drop their txn links first).
                 db_exec(
-                    'INSERT INTO invoices
-                       (invoice_no, invoice_date, vendor_id, currency, status, notes,
-                        created_by, approved_by, approved_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())',
-                    [$invoiceNo, $invDate, $vendorId, 'INR', 'approved', $headerNotes,
-                     $this->actorId, $this->actorId]
+                    'DELETE il FROM invoice_lines il
+                       JOIN invoice_items ii ON ii.id = il.invoice_item_id
+                      WHERE ii.invoice_id = ?',
+                    [$invoiceId]
                 );
+                db_exec('DELETE FROM invoice_items WHERE invoice_id = ?', [$invoiceId]);
             } else {
-                db_exec(
-                    'INSERT INTO invoices
-                       (invoice_no, invoice_date, vendor_id, currency, status, notes, created_by)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)',
-                    [$invoiceNo, $invDate, $vendorId, 'INR', 'pending', $headerNotes, $this->actorId]
-                );
+                $invoiceNo = $this->uniqueInvoiceNo((string)$g['inv_no']);
+                if ($status === 'approved') {
+                    db_exec(
+                        'INSERT INTO invoices
+                           (invoice_no, refno, invoice_date, vendor_id, currency, status, notes, fy, dept,
+                            created_by, approved_by, approved_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())',
+                        [$invoiceNo, $refno, $invDate, $vendorId, 'INR', 'approved', $headerNotes, $fy, $dept,
+                         $this->actorId, $this->actorId]
+                    );
+                } else {
+                    db_exec(
+                        'INSERT INTO invoices
+                           (invoice_no, refno, invoice_date, vendor_id, currency, status, notes, fy, dept, created_by)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                        [$invoiceNo, $refno, $invDate, $vendorId, 'INR', 'pending', $headerNotes, $fy, $dept, $this->actorId]
+                    );
+                }
+                $invoiceId = (int)db_val('SELECT LAST_INSERT_ID()', [], 0);
+                // Register so later groups / the other source pass update this
+                // same invoice rather than inserting another copy.
+                $this->existingByIdentity[$identity] = $invoiceId;
             }
-            $invoiceId = (int)db_val('SELECT LAST_INSERT_ID()', [], 0);
 
             $sort = 0;
             foreach ($rows as $r) {
@@ -284,7 +350,8 @@ class OldInventoryInvoiceImportService
             throw $e;
         }
 
-        $this->counts['inv_created']++;
+        if ($isUpdate) { $this->counts['inv_updated']++; }
+        else           { $this->counts['inv_created']++; }
         if ($status === 'approved') { $this->counts['inv_approved']++; }
         else                        { $this->counts['inv_pending']++; }
     }
@@ -326,6 +393,9 @@ class OldInventoryInvoiceImportService
         $gst   = ($gstR === null || $gstR === '') ? null : (float)$gstR;
         $hsn   = trim((string)($r['hsn_code'] ?? ''));
         $hsn   = ($hsn === '' || $hsn === '-') ? null : $hsn;
+        // Ledger is per-line in the legacy data → invoice_items.ledger.
+        $ledger = trim((string)($r['ledger'] ?? ''));
+        $ledger = ($ledger === '' || $ledger === '0') ? null : substr($ledger, 0, 64);
 
         // Resolve trans_id → the best matching shipment line for linkage.
         // trans_id is the "Txn ID" shown in the shipment list
@@ -343,11 +413,11 @@ class OldInventoryInvoiceImportService
         db_exec(
             'INSERT INTO invoice_items
                (invoice_id, sort_order, item_kind, item_code, description,
-                qty, uom, unit_price, gst_rate, hsn_code, notes)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                qty, uom, unit_price, gst_rate, hsn_code, notes, ledger)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             [$invoiceId, $sort, $itemKind, substr($code, 0, 64), substr($desc, 0, 500),
              $qty, substr($uom, 0, 16), $price, $gst, $hsn ? substr($hsn, 0, 16) : null,
-             substr($lineNote, 0, 255) ?: null]
+             substr($lineNote, 0, 255) ?: null, $ledger]
         );
         $this->counts['item_created']++;
         $invoiceItemId = (int)db_val('SELECT LAST_INSERT_ID()', [], 0);
@@ -464,6 +534,19 @@ class OldInventoryInvoiceImportService
         return $candidate;
     }
 
+    /**
+     * Natural identity for upsert matching: base invoice number (with any
+     * " (n)" dedup suffix this importer may have appended stripped off) +
+     * vendor + financial year. Two source groups that map to the same real
+     * invoice resolve to the same identity, so a re-import updates rather
+     * than duplicates.
+     */
+    private function importIdentity(string $invoiceNo, int $vendorId, string $fy): string
+    {
+        $base = preg_replace('/ \(\d+\)$/', '', trim($invoiceNo));
+        return mb_strtolower((string)$base) . '|' . $vendorId . '|' . trim($fy);
+    }
+
     // ── Build all lookup maps once up front ──────────────────────────────────
     private function buildLookupMaps(): void
     {
@@ -518,9 +601,19 @@ class OldInventoryInvoiceImportService
                 'qty_received' => (float)$r['qty_received'],
             ];
         }
-        // Preload existing invoice numbers so generated ones stay unique.
-        foreach (db_all('SELECT invoice_no FROM invoices') as $r) {
+        // Preload existing invoices: their numbers (so generated ones stay
+        // unique) AND their natural identity (so a re-import updates the
+        // matching invoice in place instead of inserting a duplicate).
+        foreach (db_all('SELECT id, invoice_no, vendor_id, fy FROM invoices') as $r) {
             $this->usedNos[mb_strtolower(trim((string)$r['invoice_no']))] = true;
+            $key = $this->importIdentity(
+                (string)$r['invoice_no'], (int)$r['vendor_id'], (string)($r['fy'] ?? '')
+            );
+            // First match wins — keeps behaviour deterministic if two rows
+            // somehow share an identity.
+            if (!isset($this->existingByIdentity[$key])) {
+                $this->existingByIdentity[$key] = (int)$r['id'];
+            }
         }
 
         $this->log(

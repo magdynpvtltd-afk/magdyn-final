@@ -1178,13 +1178,15 @@ if ($action === 'bom_grid') {
     //
     //   $qtyRejByItem[id]    = qty at LOC-REJ
     //   $qtyReworkByItem[id] = qty at O-Rework + I-Rework
+    //   $qtyHeldByItem[id]   = qty at the held locations (LOC-LIP, LOC-SMP)
     //   $qtyTotalByItem[id]  = SUM(qty) across ALL locations
-    //   $avbByItem[id]       = qtyTotal - qtyRej - qtyRework (clamped to >= 0)
+    //   $avbByItem[id]       = qtyTotal - qtyRej - qtyRework - qtyHeld
+    //                          (clamped to >= 0)
     //   $tbrByItem[id]       = open receive balance from Ship & Receipt
     //
     // Location filter is by CODE (case-insensitive, exact match), so the
     // semantics are stable even if location IDs change. If any of the
-    // three special locations don't exist in this database, the matching
+    // special locations don't exist in this database, the matching
     // aggregate for that location is just empty — safe, no error.
     // ----------------------------------------------------------------
     $rejCodes    = ['LOC-REJ'];
@@ -1192,22 +1194,25 @@ if ($action === 'bom_grid') {
 
     $qtyRejByItem    = [];
     $qtyReworkByItem = [];
+    $qtyHeldByItem   = [];
     $qtyTotalByItem  = [];
 
-    // Build a single query that returns per-item totals split into three
-    // buckets — rej, rework, all — in one pass. CASE-style sum is faster
-    // than three separate queries on Hostinger's MariaDB.
+    // Build a single query that returns per-item totals split into four
+    // buckets — rej, rework, held, all — in one pass. CASE-style sum is
+    // faster than separate queries on Hostinger's MariaDB.
     //
     // NOTE: the location table is `locations` (Assets and Inventory share
     // it after the 2026-05-17 unify-locations migration). The old
     // `inv_locations` table no longer exists.
     $rejInList    = "'" . implode("','", array_map(function ($c) { return addslashes($c); }, $rejCodes))    . "'";
     $reworkInList = "'" . implode("','", array_map(function ($c) { return addslashes($c); }, $reworkCodes)) . "'";
+    $heldInList   = inv_held_location_codes_sql();   // LOC-LIP, LOC-SMP
 
     foreach (db_all(
         "SELECT s.item_id,
                 SUM(CASE WHEN l.code COLLATE utf8mb4_unicode_ci IN ($rejInList)    THEN s.qty ELSE 0 END) AS rej_qty,
                 SUM(CASE WHEN l.code COLLATE utf8mb4_unicode_ci IN ($reworkInList) THEN s.qty ELSE 0 END) AS rework_qty,
+                SUM(CASE WHEN l.code COLLATE utf8mb4_unicode_ci IN ($heldInList)   THEN s.qty ELSE 0 END) AS held_qty,
                 SUM(s.qty) AS total_qty
            FROM inv_item_location_stock s
            JOIN locations l ON l.id = s.location_id
@@ -1216,6 +1221,7 @@ if ($action === 'bom_grid') {
         $iid = (int)$r['item_id'];
         $qtyRejByItem[$iid]    = (float)$r['rej_qty'];
         $qtyReworkByItem[$iid] = (float)$r['rework_qty'];
+        $qtyHeldByItem[$iid]   = (float)$r['held_qty'];
         $qtyTotalByItem[$iid]  = (float)$r['total_qty'];
     }
 
@@ -1383,11 +1389,18 @@ if ($action === 'bom_grid') {
             <h2 class="dt-toolbar-title bom-actions-title">BOM tree</h2>
             <div class="dt-toolbar-right">
                 <?php if ($canCreateBoms || $canManageBoms): ?>
+                    <?php if (is_admin()): /* Old-inventory import is admin-only (Admin ▸ Old Inventory Import). */ ?>
                     <a class="btn btn-sm btn-ghost" href="<?= h(url('/bom_old_import.php')) ?>"
                        title="Auto-fetch all BOM trees from old inventory server and import">⬇ Import from Old System</a>
+                    <?php endif; ?>
                     <button type="button" class="btn btn-sm btn-ghost"
                             data-open-import="bom-import-modal"
                             title="Import BOM lines from CSV">⤒ Import BOM CSV</button>
+                <?php endif; ?>
+                <?php if (permission_check('inventory_shiprcpt', 'manage')): ?>
+                    <button type="button" class="btn btn-sm btn-ghost"
+                            data-open-import="receipt-verify-modal"
+                            title="Upload the old Ship &amp; Receipt Report CSV to mark received shipments">✓ Verify Received CSV</button>
                 <?php endif; ?>
                 <?php if ($canManageBoms): ?>
                     <button type="button" class="btn btn-sm btn-primary"
@@ -1540,8 +1553,11 @@ if ($action === 'bom_grid') {
                         $iidThis  = (int)$item['id'];
                         $rejQty    = isset($qtyRejByItem[$iidThis])    ? $qtyRejByItem[$iidThis]    : 0.0;
                         $reworkQty = isset($qtyReworkByItem[$iidThis]) ? $qtyReworkByItem[$iidThis] : 0.0;
+                        $heldQty   = isset($qtyHeldByItem[$iidThis])   ? $qtyHeldByItem[$iidThis]   : 0.0;
                         $totalQty  = isset($qtyTotalByItem[$iidThis])  ? $qtyTotalByItem[$iidThis]  : 0.0;
-                        $avbQty    = $totalQty - $rejQty - $reworkQty;
+                        // Held stock (LOC-LIP / LOC-SMP) is on-hand but not
+                        // available — excluded from Avb just like rej / rework.
+                        $avbQty    = $totalQty - $rejQty - $reworkQty - $heldQty;
                         if ($avbQty < 0) $avbQty = 0.0;   // clamp; shouldn't go negative in normal data
                         $tbrQty    = isset($tbrByItem[$iidThis]) ? $tbrByItem[$iidThis] : 0.0;
                     ?>
@@ -2132,6 +2148,21 @@ if ($action === 'bom_grid') {
               . '1 → finished good, 2 → sub assembly, 3 → raw material. '
               . 'Division defaults to <strong>mech</strong>, UoM to <strong>nos</strong>. '
               . 'Cycle prevention runs across the union of existing BOM + this CSV.'
+        );
+    endif; ?>
+    <?php if (permission_check('inventory_shiprcpt', 'manage')):
+        import_modal_html(
+            'receipt-verify-modal',
+            'Verify received (Ship & Receipt Report CSV)',
+            url('/inventory.php?action=receipt_verify_preview'),
+            'Upload the old system\'s <strong>Ship and Receipt Report</strong> CSV '
+              . '(columns <code>TransID, …, Status, …</code>). Every transaction whose '
+              . '<code>Status</code> contains <code>RX</code> is matched to its receive '
+              . 'line by <code>TransID</code>; that line\'s received qty is set to its '
+              . 'planned qty and its shipment is marked <strong>received</strong>. '
+              . '<strong>Stock is not changed</strong> — no inventory txns are posted. '
+              . 'You\'ll see a preview before anything is committed.',
+            false  // no upsert toggle
         );
     endif; ?>
     <?php require dirname(__DIR__, 2) . '/includes/footer.php'; exit;

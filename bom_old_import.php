@@ -896,12 +896,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'import
 
 // ── AJAX POST: action=import_stock_from_tree ─────────────────────────────────
 //   Final step of "Import Transactions & Shipments". Fetches the per-item
-//   stock_locations from tree7-5.php and writes the on-hand (available)
-//   quantities into MagDyn, mapping ONLY these two old-system locations:
+//   stock_locations from tree7-5.php and writes the on-hand quantities
+//   into MagDyn, mapping these four old-system locations:
 //
 //       old "Magdyn"            → MagDyn location  Magdyn   (available qty)
-//       old "Rejection_Return"  → MagDyn location  LOC-REJ
+//       old "Rejection_Return"  → MagDyn location  LOC-REJ  (quarantine)
+//       old "Lost In Process"   → MagDyn location  LOC-LIP  ┐ held: tracked but
+//       old "Sample"            → MagDyn location  LOC-SMP  ┘ NOT available /
+//                                                            process / shippable
 //
+//   The two held locations (LOC-LIP / LOC-SMP) are auto-created if absent.
 //   All other old-system stock locations are ignored. Quantities are set
 //   absolutely (the old system's current balance), straight into
 //   inv_item_location_stock — no inv_txns rows are written, so the audit
@@ -916,9 +920,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'import
     @set_time_limit(300);
 
     // old-system stock location (normalised) → MagDyn locations.code
+    //
+    //   Magdyn           → Magdyn   (available stock)
+    //   Rejection_Return → LOC-REJ  (quarantine; excluded from Avb)
+    //   Lost In Process  → LOC-LIP  ┐ "held" buckets — tracked on-hand but
+    //   Sample           → LOC-SMP  ┘ never Available / process / shippable
+    //                                 (see inv_held_location_codes()).
     $locMap = [
         'magdyn'           => 'Magdyn',
         'rejection_return' => 'LOC-REJ',
+        'lost_in_process'  => 'LOC-LIP',
+        'sample'           => 'LOC-SMP',
+    ];
+
+    // Held locations are auto-created (code → name) on first import so
+    // their quantities always have somewhere to land instead of being
+    // silently counted as skipped_no_loc.
+    $autoCreateLoc = [
+        'LOC-LIP' => 'Lost In Process',
+        'LOC-SMP' => 'Sample',
     ];
 
     try {
@@ -933,6 +953,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'import
         foreach (array_unique(array_values($locMap)) as $lc) {
             $r = db_one('SELECT id FROM locations WHERE code = ? LIMIT 1', [$lc]);
             if (!$r) $r = db_one('SELECT id FROM locations WHERE LOWER(name) = LOWER(?) LIMIT 1', [$lc]);
+            if (!$r && isset($autoCreateLoc[$lc])) {
+                // First import: stand up the held location so its qty lands
+                // somewhere. Active so it shows in the Locations register and
+                // in Move pickers (qty here can only be added or moved).
+                db_exec(
+                    'INSERT INTO locations (code, name, notes, sort_order, is_active)
+                          VALUES (?, ?, ?, 100, 1)',
+                    [$lc, $autoCreateLoc[$lc],
+                     'Held stock — not available for process or shipment. Imported from old system.']
+                );
+                $newId = (int)db_val('SELECT LAST_INSERT_ID()', [], 0);
+                if ($newId) $r = ['id' => $newId];
+            }
             $locIds[$lc] = $r ? (int)$r['id'] : null;
         }
 
@@ -1739,9 +1772,12 @@ require __DIR__ . '/includes/header.php';
             auto-generated PO number. Run <strong>Delete All Inventory Records</strong> before
             re-importing — the import refuses to run if <code>inv_txns</code> / <code>inv_shipments</code>
             already contain rows. As a final step it fetches stock from
-            <code>tree7-5.php</code> and writes the available quantities into MagDyn —
+            <code>tree7-5.php</code> and writes the quantities into MagDyn —
             old <strong>Magdyn</strong> → location <code>Magdyn</code> (available),
-            old <strong>Rejection_Return</strong> → location <code>LOC-Rej</code>.
+            old <strong>Rejection_Return</strong> → location <code>LOC-Rej</code>,
+            old <strong>Lost In Process</strong> → <code>LOC-LIP</code> and
+            old <strong>Sample</strong> → <code>LOC-SMP</code> (held stock — tracked
+            on-hand but not available for process or shipment).
         </p>
 
         <!-- Progress widget (hidden until import starts) -->
@@ -1779,7 +1815,7 @@ require __DIR__ . '/includes/header.php';
                         'shipments' => 'Shipments',
                         'receipts'  => 'Receipts',
                         'po'        => 'Purchase Orders',
-                        'stock'     => 'Stock (Magdyn → Available, Rejection_Return → LOC-Rej)',
+                        'stock'     => 'Stock (Magdyn → Available, Rejection_Return → LOC-Rej, Lost In Process → LOC-LIP, Sample → LOC-SMP)',
                     ] as $key => $lbl): ?>
                     <tr id="txn-row-<?= $key ?>">
                         <td style="padding:7px 10px;border:1px solid #e5e7eb;"><?= h($lbl) ?></td>

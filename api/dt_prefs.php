@@ -13,6 +13,7 @@
 require_once __DIR__ . '/../includes/bootstrap.php';
 require_login();
 require_once __DIR__ . '/../includes/user_dt_prefs.php';
+require_once __DIR__ . '/../includes/user_dt_view.php';
 
 header('Content-Type: application/json; charset=utf-8');
 
@@ -80,6 +81,19 @@ switch ($op) {
 
     case 'reset':
         $ok = user_dt_prefs_reset($uid, $dtId);
+        echo json_encode(['ok' => $ok]);
+        exit;
+
+    case 'save_view':
+        // Persist the table's view state: global search, per-column
+        // (server + client) filters, active sort, and page size.
+        $state = is_array($body['state'] ?? null) ? $body['state'] : [];
+        $ok = user_dt_view_save($uid, $dtId, $state);
+        echo json_encode(['ok' => $ok]);
+        exit;
+
+    case 'clear_view':
+        $ok = user_dt_view_clear($uid, $dtId);
         echo json_encode(['ok' => $ok]);
         exit;
 

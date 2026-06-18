@@ -817,6 +817,9 @@ if ($action === 'bom_for_receive_item') {
     $stockByItem = [];
     if (!empty($childIds)) {
         $placeholders = implode(',', array_fill(0, count($childIds), '?'));
+        // Held locations (LOC-LIP / LOC-SMP) are excluded — their stock is
+        // tracked but can never be shipped, only added to or moved.
+        $heldInList = inv_held_location_codes_sql();
         $stockRows = db_all(
             "SELECT s.item_id, s.location_id, s.qty, l.name AS loc_name, l.code AS loc_code
                FROM inv_item_location_stock s
@@ -824,6 +827,7 @@ if ($action === 'bom_for_receive_item') {
               WHERE s.item_id IN ($placeholders)
                 AND s.qty > 0
                 AND l.is_active = 1
+                AND l.code COLLATE utf8mb4_unicode_ci NOT IN ($heldInList)
               ORDER BY s.qty DESC, l.name",
             $childIds
         );
@@ -877,12 +881,16 @@ if ($action === 'stock_by_location') {
         echo json_encode(['ok' => false, 'reason' => 'Missing item_id']);
         exit;
     }
+    // Held locations (LOC-LIP / LOC-SMP) are excluded — their stock can
+    // never be shipped, only added to or moved.
+    $heldInList = inv_held_location_codes_sql();
     $rows = db_all(
-        'SELECT l.id, l.name, l.code, s.qty
+        "SELECT l.id, l.name, l.code, s.qty
            FROM inv_item_location_stock s
            JOIN locations l ON l.id = s.location_id
           WHERE s.item_id = ? AND s.qty > 0 AND l.is_active = 1
-          ORDER BY s.qty DESC, l.name',
+            AND l.code COLLATE utf8mb4_unicode_ci NOT IN ($heldInList)
+          ORDER BY s.qty DESC, l.name",
         [$itemId]
     );
     echo json_encode([
@@ -1054,8 +1062,7 @@ if ($action === 'save') {
             . '; line_kind count=' . count((array)($_POST['line_kind'] ?? []))
             . '; line_item_id count=' . count((array)($_POST['line_item_id'] ?? []))
             . '; line_qty count=' . count((array)($_POST['line_qty'] ?? []))
-            . '; line_src_location_id count=' . count((array)($_POST['line_src_location_id'] ?? []))
-            . '; src values=[' . implode(',', (array)($_POST['line_src_location_id'] ?? [])) . ']');
+            . '; line_src_json count=' . count((array)($_POST['line_src_json'] ?? [])));
 
     require_permission('inventory_shiprcpt', 'manage');
     csrf_check();
@@ -1227,7 +1234,9 @@ if ($action === 'save') {
         $kinds = (array)input('line_kind', []);
         $items = (array)input('line_item_id', []);
         $qtys  = (array)input('line_qty', []);
-        $srcs  = (array)input('line_src_location_id', []);
+        // Per-ship-line source split, one JSON array per row: [{loc,qty},...].
+        // Parallel to the other line_* arrays (empty on receive / non-item rows).
+        $srcJsons = (array)input('line_src_json', []);
         $lnotes= (array)input('line_notes', []);
         // Phase C — entity_type per line, plus the optional asset_id
         // (for entity_type='asset' lines), pending_name (for not-yet-
@@ -1251,13 +1260,39 @@ if ($action === 'save') {
         // Step 1 — validate + build a $specs list. Same gates as
         // before; bad rows still bail out via redirect.
         // ------------------------------------------------------------
+        // Held locations (LOC-LIP / LOC-SMP) can never be a ship source —
+        // their stock is add/move only. Resolve their ids once for the
+        // per-line guard below (the Source picker already omits them; this
+        // defends against a hand-crafted POST).
+        $heldLocIds = [];
+        $heldInList = inv_held_location_codes_sql();
+        foreach (db_all(
+            "SELECT id FROM locations WHERE code COLLATE utf8mb4_unicode_ci IN ($heldInList)"
+        ) as $hr) {
+            $heldLocIds[(int)$hr['id']] = true;
+        }
+
         $specs = [];
         for ($i = 0; $i < $n; $i++) {
             $lid    = isset($lineIds[$i]) ? (int)$lineIds[$i] : 0;
             $kind   = isset($kinds[$i]) ? (string)$kinds[$i] : '';
             $itemId = isset($items[$i]) ? (int)$items[$i] : 0;
             $qty    = isset($qtys[$i])  ? (float)$qtys[$i] : 0;
-            $srcId  = isset($srcs[$i])  ? (int)$srcs[$i]  : 0;
+            // Decode this row's source split. Each entry is {loc, qty}; blank /
+            // zero rows are dropped. src_location_id (legacy column) is set to
+            // the first entry's location for backward-compatible display.
+            $srcEntries = [];
+            if (isset($srcJsons[$i]) && $srcJsons[$i] !== '') {
+                $decoded = json_decode((string)$srcJsons[$i], true);
+                if (is_array($decoded)) {
+                    foreach ($decoded as $d) {
+                        $eLoc = (int)($d['loc'] ?? 0);
+                        $eQty = (float)($d['qty'] ?? 0);
+                        if ($eLoc > 0 && $eQty > 0) $srcEntries[] = ['loc' => $eLoc, 'qty' => $eQty];
+                    }
+                }
+            }
+            $srcId  = $srcEntries ? (int)$srcEntries[0]['loc'] : 0;
             $ln     = isset($lnotes[$i]) ? trim((string)$lnotes[$i]) : '';
             $entity = isset($entities[$i]) ? (string)$entities[$i] : 'inv_item';
             if (!in_array($entity, ['inv_item', 'asset'], true)) $entity = 'inv_item';
@@ -1283,21 +1318,49 @@ if ($action === 'save') {
             if (!in_array($kind, ['ship', 'receive'], true)) continue;
             if ($mode === 'ship'    && $kind !== 'ship')    continue;
             if ($mode === 'receive' && $kind !== 'receive') continue;
-            if ($kind === 'ship' && $entity === 'inv_item' && $itemId > 0 && $srcId <= 0) {
-                db()->rollBack();
-                flash_set('error', 'Each ship line for an inventory item needs a source location.');
-                redirect(url('/inventory_shiprcpt.php?action=' . ($isNew ? 'new' : 'edit&id=' . $id)));
-            }
             if ($kind === 'ship' && $entity === 'inv_item' && $itemId > 0) {
-                try {
-                    $stockRow = db_one(
-                        'SELECT qty FROM inv_item_location_stock WHERE item_id = ? AND location_id = ?',
-                        [$itemId, $srcId]
-                    );
-                    if (!$stockRow || (float)$stockRow['qty'] <= 0) {
+                // At least one source.
+                if (!$srcEntries) {
+                    db()->rollBack();
+                    flash_set('error', 'Each ship line for an inventory item needs at least one source location.');
+                    redirect(url('/inventory_shiprcpt.php?action=' . ($isNew ? 'new' : 'edit&id=' . $id)));
+                }
+                // Sources must allocate exactly the line quantity.
+                $alloc = 0.0;
+                foreach ($srcEntries as $e) $alloc += $e['qty'];
+                if (abs($alloc - $qty) > 0.0001) {
+                    db()->rollBack();
+                    flash_set('error', sprintf(
+                        'Ship line sources must sum to the line quantity (need %g, allocated %g) for item #%d.',
+                        $qty, $alloc, $itemId));
+                    redirect(url('/inventory_shiprcpt.php?action=' . ($isNew ? 'new' : 'edit&id=' . $id)));
+                }
+                // Held locations may never be a ship source.
+                foreach ($srcEntries as $e) {
+                    if (isset($heldLocIds[$e['loc']])) {
                         db()->rollBack();
-                        flash_set('error', 'Ship line source location has no stock for item #' . $itemId . '.');
+                        flash_set('error', 'Held stock (Lost In Process / Sample) cannot be shipped. '
+                            . 'Move it to an available location first.');
                         redirect(url('/inventory_shiprcpt.php?action=' . ($isNew ? 'new' : 'edit&id=' . $id)));
+                    }
+                }
+                // Each source location must hold enough stock. Aggregate by
+                // location so two entries on the same loc are summed.
+                $byLoc = [];
+                foreach ($srcEntries as $e) $byLoc[$e['loc']] = ($byLoc[$e['loc']] ?? 0) + $e['qty'];
+                try {
+                    foreach ($byLoc as $eLoc => $eQty) {
+                        $have = (float)db_val(
+                            'SELECT qty FROM inv_item_location_stock WHERE item_id = ? AND location_id = ?',
+                            [$itemId, $eLoc], 0.0
+                        );
+                        if ($have + 0.0001 < $eQty) {
+                            db()->rollBack();
+                            flash_set('error', sprintf(
+                                'Source location #%d has only %g of item #%d (need %g).',
+                                $eLoc, $have, $itemId, $eQty));
+                            redirect(url('/inventory_shiprcpt.php?action=' . ($isNew ? 'new' : 'edit&id=' . $id)));
+                        }
                     }
                 } catch (\Throwable $sve) {
                     error_log('[shiprcpt save] stock check skipped: ' . $sve->getMessage());
@@ -1317,6 +1380,7 @@ if ($action === 'save') {
                 'unit_price'      => $linePrice,
                 'gst_rate'        => $lineGst,
                 'src_location_id' => ($kind === 'ship' && $entity === 'inv_item' && $itemId > 0) ? $srcId : null,
+                'sources'         => ($kind === 'ship' && $entity === 'inv_item' && $itemId > 0) ? $srcEntries : [],
                 'before_date'     => $beforeDt   !== '' ? $beforeDt   : null,
                 'delivery_date'   => $deliveryDt !== '' ? $deliveryDt : null,
                 'notes'           => $ln ?: null,
@@ -1334,6 +1398,21 @@ if ($action === 'save') {
         // Amendments: UPDATE existing / INSERT new / DELETE only if
         //   the existing line has no events behind it.
         // ------------------------------------------------------------
+        // Rewrite a line's source-split rows: clear then re-insert. Always
+        // called (even with no entries) so the table stays in sync when a
+        // line stops being a multi-source ship line.
+        $persistSources = function ($lineId, $sources) {
+            $lineId = (int)$lineId;
+            if ($lineId <= 0) return;
+            db_exec('DELETE FROM inv_shipment_line_sources WHERE shipment_line_id = ?', [$lineId]);
+            foreach ((array)$sources as $e) {
+                db_exec(
+                    'INSERT INTO inv_shipment_line_sources (shipment_line_id, location_id, qty)
+                     VALUES (?, ?, ?)',
+                    [$lineId, (int)$e['loc'], (float)$e['qty']]
+                );
+            }
+        };
         $written = 0;
         if ($isAmendingSave) {
             $existingIds = [];
@@ -1380,6 +1459,7 @@ if ($action === 'save') {
                          $s['before_date'], $s['delivery_date'], $s['notes'],
                          (int)$s['line_id']]
                     );
+                    $persistSources((int)$s['line_id'], $s['sources']);
                 } else {
                     db_exec(
                         'INSERT INTO inv_shipment_lines
@@ -1395,6 +1475,7 @@ if ($action === 'save') {
                          $s['src_location_id'],
                          $s['before_date'], $s['delivery_date'], $s['notes']]
                     );
+                    $persistSources((int)db()->lastInsertId(), $s['sources']);
                 }
                 $written++;
             }
@@ -1407,6 +1488,14 @@ if ($action === 'save') {
         } else {
             // Draft mode — keep the original wipe-and-reinsert. Cheap
             // and correct because drafts can't have events yet.
+            // Clear source-split rows for the shipment's lines first so the
+            // line wipe doesn't orphan them.
+            db_exec(
+                'DELETE FROM inv_shipment_line_sources
+                  WHERE shipment_line_id IN (
+                        SELECT id FROM inv_shipment_lines WHERE shipment_id = ?)',
+                [$id]
+            );
             db_exec('DELETE FROM inv_shipment_lines WHERE shipment_id = ?', [$id]);
             foreach ($specs as $s) {
                 db_exec(
@@ -1423,6 +1512,7 @@ if ($action === 'save') {
                      $s['src_location_id'],
                      $s['before_date'], $s['delivery_date'], $s['notes']]
                 );
+                $persistSources((int)db()->lastInsertId(), $s['sources']);
                 $written++;
             }
         }
@@ -1546,17 +1636,30 @@ if ($action === 'ship') {
                     );
                 }
             } elseif (!empty($L['item_id'])) {
-                // Regular inv_item ship line — post the ledger txn.
-                inv_post_txn(
-                    'ship_out',
-                    $actualShipDate,
-                    (int)$L['item_id'],
-                    (int)$L['src_location_id'],
-                    -1 * (float)$L['qty_planned'],
-                    null,
-                    $sh['ref_doc'] ?: null,
-                    'Ship-out for ' . $sh['ship_no']
+                // Regular inv_item ship line — post the ledger txn(s). A line
+                // can be split across several source locations; post one
+                // ship_out per source row. Legacy lines with no split rows
+                // fall back to the single src_location_id for the whole qty.
+                $srcRows = db_all(
+                    'SELECT location_id, qty FROM inv_shipment_line_sources
+                      WHERE shipment_line_id = ? ORDER BY id',
+                    [(int)$L['id']]
                 );
+                if (empty($srcRows)) {
+                    $srcRows = [['location_id' => (int)$L['src_location_id'], 'qty' => (float)$L['qty_planned']]];
+                }
+                foreach ($srcRows as $sr) {
+                    inv_post_txn(
+                        'ship_out',
+                        $actualShipDate,
+                        (int)$L['item_id'],
+                        (int)$sr['location_id'],
+                        -1 * (float)$sr['qty'],
+                        null,
+                        $sh['ref_doc'] ?: null,
+                        'Ship-out for ' . $sh['ship_no']
+                    );
+                }
             }
             // Pending-name lines on the ship side don't ship anything
             // — they describe an expected receipt. Skip them safely.
@@ -1616,13 +1719,23 @@ if ($action === 'receive_save') {
         flash_set('error', 'Receipt qty must be > 0.');
         redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
     }
+    // Receipts must not exceed the still-open quantity on the line
+    // (qty_planned - qty_received). A tiny epsilon absorbs float noise so
+    // a legitimate "receive the exact remainder" isn't rejected.
+    $openQty = max(0.0, (float)$line['qty_planned'] - (float)$line['qty_received']);
+    if ($qty > $openQty + 0.0001) {
+        $openLabel = rtrim(rtrim(number_format($openQty, 3, '.', ''), '0'), '.');
+        flash_set('error', 'Receipt qty exceeds the open quantity (' . $openLabel . ' remaining).');
+        redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+    }
 
-    // Force destination to LOC-QCH (Quality Check Hold). All incoming
-    // material lands here pending inspection regardless of what the
-    // operator picked on the form. The inspection's approval routes
-    // the qty out to the appropriate location automatically. We still
-    // accept whatever was posted (so old forms don't error) but the
-    // override below ignores it.
+    // Destination is decided server-side, not from the form. Items that
+    // carry an active inspection template land at LOC-QCH (Quality Check
+    // Hold) pending inspection — the inspection's approval routes the qty
+    // out automatically. Items with NO template skip QC entirely and are
+    // added straight to stores (ST-HLD). The per-item decision is made
+    // below (after any pending item is materialised); $qchLocId is the
+    // default used by the asset receive branch.
     $qchLocId = qc_loc_id('LOC-QCH');
     if (!$qchLocId) {
         flash_set('error', 'LOC-QCH location is missing. Run the migration that seeds it.');
@@ -1690,6 +1803,21 @@ if ($action === 'receive_save') {
         }
     }
 
+    // Per-item destination: with an active inspection template the qty
+    // goes to QC Hold and an inspection is auto-created below; without
+    // one it goes straight to stores (ST-HLD) and no inspection is made.
+    $tplId = qc_item_template_id((int)$line['item_id']);
+    if ($tplId) {
+        $locId = $qchLocId;
+    } else {
+        $stHldId = qc_loc_id('ST-HLD');
+        if (!$stHldId) {
+            flash_set('error', 'ST-HLD (stores) location is missing. Run the migration that seeds it.');
+            redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+        }
+        $locId = $stHldId;
+    }
+
     try {
         db()->beginTransaction();
         // inv_post_txn returns ['txn_id' => N, 'qty_after' => X] — extract
@@ -1719,10 +1847,14 @@ if ($action === 'receive_save') {
         );
         shr_recompute_line_received((int)$line['id']);
 
-        // Auto-create the QC inspection. Linked to this txn so it shows
-        // in the pending QC list and the approve step can move the
-        // qty out of LOC-QCH atomically.
-        qc_auto_create_inspection_for_txn($txnId);
+        // Auto-create the QC inspection only when the item has a
+        // template. Linked to this txn so it shows in the pending QC
+        // list and the approve step can move the qty out of LOC-QCH
+        // atomically. Template-less items are already in stores (ST-HLD)
+        // and need no inspection.
+        if ($tplId) {
+            qc_auto_create_inspection_for_txn($txnId);
+        }
 
         // Phase C2 — persist Price + GST% to the receive-side pricing
         // table so the PO print can render them and Phase D invoicing
@@ -1765,11 +1897,14 @@ if ($action === 'receive_save') {
         flash_set('error', 'Receipt failed: ' . $e->getMessage());
         redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
     }
+    $destCode = $tplId ? 'LOC-QCH' : 'ST-HLD';
     db_exec(
         "INSERT INTO audit_log (actor_id, action, target_id, details) VALUES (?, 'shiprcpt.receive', ?, ?)",
-        [$uid, $id, $sh['ship_no'] . ' line ' . $line['id'] . ' qty ' . $qty . ' to LOC-QCH']
+        [$uid, $id, $sh['ship_no'] . ' line ' . $line['id'] . ' qty ' . $qty . ' to ' . $destCode]
     );
-    flash_set('success', 'Receipt recorded at LOC-QCH; inspection pending.');
+    flash_set('success', $tplId
+        ? 'Receipt recorded at LOC-QCH; inspection pending.'
+        : 'Receipt recorded; qty added to stores (ST-HLD). No template — QC skipped.');
     redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
 }
 
@@ -1911,6 +2046,25 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
     $lines = $id > 0
         ? db_all('SELECT * FROM inv_shipment_lines WHERE shipment_id = ? ORDER BY sort_order, id', [$id])
         : [];
+    // Per-line source splits (multi-location pick). Keyed by line id; each
+    // value is the list of {loc, qty} entries the operator chose. Lines with
+    // no split rows fall back below to a single entry from src_location_id.
+    $srcByLine = [];
+    if ($id > 0) {
+        foreach (db_all(
+            'SELECT shipment_line_id, location_id, qty
+               FROM inv_shipment_line_sources
+              WHERE shipment_line_id IN (
+                    SELECT id FROM inv_shipment_lines WHERE shipment_id = ?)
+              ORDER BY id',
+            [$id]
+        ) as $r) {
+            $srcByLine[(int)$r['shipment_line_id']][] = [
+                'loc' => (int)$r['location_id'],
+                'qty' => (float)$r['qty'],
+            ];
+        }
+    }
     if (empty($lines)) $lines = [null];
     else $lines[] = null;   // one trailing empty for adding
 
@@ -2315,7 +2469,7 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
                         <th class="r" style="width: 70px;">GST %</th>
                     <?php endif; ?>
                     <?php if ($secKind === 'ship'): ?>
-                        <th style="width: 150px;">Source</th>
+                        <th style="width: 300px;">Source (pick from)</th>
                         <th style="width: 130px;">Before date</th>
                     <?php else: ?>
                         <th style="width: 130px;">Delivery date</th>
@@ -2344,16 +2498,28 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
                 $lSubType = $lEntity === 'asset'
                           ? 'asset'
                           : (!$lItemId && $lPending !== '' ? 'pending' : 'item');
+                // Source split for this ship line: prefer persisted multi-source
+                // rows; fall back to a single entry from src_location_id (legacy /
+                // BOM-checklist lines). Empty for receive / new rows.
+                $lSrcEntries = [];
+                if ($secKind === 'ship' && $isExisting) {
+                    if (!empty($srcByLine[$lLineId])) {
+                        $lSrcEntries = $srcByLine[$lLineId];
+                    } elseif ($lSrc > 0) {
+                        $lSrcEntries = [['loc' => $lSrc, 'qty' => (float)$L['qty_planned']]];
+                    }
+                }
             ?>
                 <tr class="shr-line-row" data-subtype="<?= h($lSubType) ?>">
                     <!-- line_id[] for UPDATE/INSERT/DELETE diff on amendment. 0 = new row. -->
                     <input type="hidden" name="line_id[]"   value="<?= (int)$lLineId ?>">
                     <!-- kind is fixed per section — hidden input, not a dropdown -->
                     <input type="hidden" name="line_kind[]" value="<?= h($secKind) ?>" class="shr-line-kind">
-                    <?php if ($secKind === 'receive'): ?>
-                        <!-- receive rows have no source; emit hidden to keep parallel arrays aligned -->
-                        <input type="hidden" name="line_src_location_id[]" value="">
-                    <?php endif; ?>
+                    <!-- Source split as JSON [{loc,qty},...]. Parallel array across
+                         ship + receive rows; empty on receive/new rows. The visible
+                         widget (ship rows only) reads/writes this hidden value. -->
+                    <input type="hidden" name="line_src_json[]" class="shr-src-json"
+                           value="<?= h(json_encode($lSrcEntries)) ?>">
                     <td>
                         <select class="no-combobox shr-line-subtype">
                             <option value="item"    <?= $lSubType === 'item'    ? 'selected' : '' ?>>Item</option>
@@ -2441,15 +2607,9 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
                     <?php endif; ?>
                     <?php if ($secKind === 'ship'): ?>
                         <td>
-                            <select name="line_src_location_id[]" class="shr-line-src">
-                                <option value="">— pick a source —</option>
-                                <?php foreach ($locations as $loc): ?>
-                                    <option value="<?= (int)$loc['id'] ?>"
-                                            <?= (int)$loc['id'] === $lSrc ? 'selected' : '' ?>>
-                                        <?= h($loc['name']) ?>
-                                    </option>
-                                <?php endforeach; ?>
-                            </select>
+                            <!-- Multi-location source widget. Populated by JS from
+                                 the row's stock + the line_src_json hidden value. -->
+                            <div class="shr-src-widget"></div>
                         </td>
                     <?php endif; ?>
                     <?php if ($secKind === 'ship'): ?>
@@ -2567,85 +2727,188 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
             return (Math.round(n * 1000) / 1000).toString();
         }
 
-        // Rebuild Source dropdown for a ship row from the stock-by-loc response.
-        function rebuildSourceOptions(row, locs) {
-            var srcSel = row.querySelector('.shr-line-src');
-            if (!srcSel) return;   // receive rows have no source select
-            var prevVal = srcSel.value;
-            var wrap = srcSel.closest('.cb-wrap');
-            if (wrap && wrap.parentNode) {
-                wrap.parentNode.insertBefore(srcSel, wrap);
-                wrap.parentNode.removeChild(wrap);
-            }
-            srcSel.classList.remove('cb-bound', 'cb-native');
-            srcSel.innerHTML = '';
-
-            var placeholderOpt = document.createElement('option');
-            placeholderOpt.value = '';
-            if (locs.length === 0) {
-                placeholderOpt.textContent = '— no stock available —';
-                placeholderOpt.disabled = true;
-            } else {
-                placeholderOpt.textContent = '— pick a source —';
-            }
-            srcSel.appendChild(placeholderOpt);
-
-            locs.forEach(function (loc) {
-                var opt = document.createElement('option');
-                opt.value = loc.id;
-                opt.textContent = loc.name + ' (' + fmtQty(loc.qty) + ')';
-                if (String(loc.id) === String(prevVal)) opt.selected = true;
-                srcSel.appendChild(opt);
+        function escapeHtml(s) {
+            return String(s).replace(/[&<>"]/g, function (c) {
+                return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c];
             });
-            if (window.MagDynCombobox && typeof window.MagDynCombobox.initAll === 'function') {
-                window.MagDynCombobox.initAll(row);
-            }
         }
 
-        // Refresh the source dropdown when the item changes (ship rows only).
+        // ---- Multi-location source widget (ship rows) -------------------
+        // A ship line draws its planned qty from one or more source locations.
+        // The split lives in the row's hidden .shr-src-json as [{loc,qty},...];
+        // the widget reads/writes that value and shows a live allocated total
+        // versus the line qty. Selects carry .no-combobox so the global
+        // combobox enhancer leaves them as plain native dropdowns.
+        function readSrcEntries(row) {
+            var h = row.querySelector('.shr-src-json');
+            if (!h) return [];
+            try { var a = JSON.parse(h.value || '[]'); return Array.isArray(a) ? a : []; }
+            catch (e) { return []; }
+        }
+        function writeSrcEntries(row, entries) {
+            var h = row.querySelector('.shr-src-json');
+            if (h) h.value = JSON.stringify(entries || []);
+        }
+        function rowLineQty(row) {
+            var q = row.querySelector('input[name="line_qty[]"]');
+            return q ? (parseFloat(q.value || '0') || 0) : 0;
+        }
+        function srcLocOptions(locs, selectedLoc) {
+            var html = '<option value="">— pick —</option>';
+            var found = false;
+            locs.forEach(function (loc) {
+                var sel = (String(loc.id) === String(selectedLoc));
+                if (sel) found = true;
+                html += '<option value="' + loc.id + '"' + (sel ? ' selected' : '') + '>'
+                      + escapeHtml(loc.name + ' (' + fmtQty(loc.qty) + ')') + '</option>';
+            });
+            // Preserve a previously-chosen loc that no longer reports stock so
+            // the operator's pick isn't silently dropped (server re-validates).
+            if (selectedLoc && !found) {
+                html += '<option value="' + selectedLoc + '" selected>Loc #' + selectedLoc + ' (0)</option>';
+            }
+            return html;
+        }
+
+        // Build the widget DOM for a ship row from its entries + the item's
+        // stock list (locs = [{id,name,code,qty}]). Wires entry + add/remove.
+        function renderSrcWidget(row, locs) {
+            var widget = row.querySelector('.shr-src-widget');
+            if (!widget) return;   // receive rows have no widget
+            row._srcLocs = locs || [];
+            var itemEl = row.querySelector('.shr-line-item');
+            var itemId = itemEl ? parseInt(itemEl.value || '0', 10) : 0;
+            if (!itemId) {
+                widget.innerHTML = '<span class="muted small">Pick an item first.</span>';
+                return;
+            }
+            var entries = readSrcEntries(row);
+            if (!entries.length) entries = [{ loc: 0, qty: 0 }];
+            var html = '<table class="shr-src-table" style="width:100%;border-collapse:collapse;"><tbody>';
+            entries.forEach(function (e, idx) {
+                html += '<tr>'
+                    + '<td style="padding:1px 2px;"><select class="no-combobox shr-src-loc" data-idx="' + idx
+                        + '" style="width:100%;">' + srcLocOptions(locs, e.loc) + '</select></td>'
+                    + '<td style="padding:1px 2px;width:70px;"><input class="shr-src-qty r" type="number" '
+                        + 'step="0.001" min="0" data-idx="' + idx + '" value="' + (e.qty ? fmtQty(e.qty) : '')
+                        + '" placeholder="qty" style="width:100%;"></td>'
+                    + '<td style="padding:1px 2px;width:24px;">' + (entries.length > 1
+                        ? '<button type="button" class="btn btn-icon btn-danger shr-src-del" data-idx="' + idx
+                          + '" title="Remove">🗑</button>'
+                        : '') + '</td>'
+                    + '</tr>';
+            });
+            html += '</tbody></table>';
+            html += '<div style="display:flex;align-items:center;gap:8px;margin-top:2px;">'
+                  + '<button type="button" class="btn btn-ghost btn-sm shr-src-add">+ source</button>'
+                  + '<span class="shr-src-status small"></span></div>';
+            widget.innerHTML = html;
+            writeSrcEntries(row, entries);
+
+            widget.querySelectorAll('.shr-src-loc').forEach(function (sel) {
+                sel.addEventListener('change', function () {
+                    var idx = parseInt(sel.getAttribute('data-idx'), 10);
+                    var es = readSrcEntries(row);
+                    if (es[idx]) { es[idx].loc = parseInt(sel.value || '0', 10); writeSrcEntries(row, es); }
+                    recomputeSrc(row);
+                });
+            });
+            widget.querySelectorAll('.shr-src-qty').forEach(function (inp) {
+                inp.addEventListener('input', function () {
+                    var idx = parseInt(inp.getAttribute('data-idx'), 10);
+                    var es = readSrcEntries(row);
+                    if (es[idx]) { es[idx].qty = parseFloat(inp.value || '0') || 0; writeSrcEntries(row, es); }
+                    recomputeSrc(row);
+                });
+            });
+            widget.querySelector('.shr-src-add').addEventListener('click', function () {
+                var es = readSrcEntries(row); es.push({ loc: 0, qty: 0 }); writeSrcEntries(row, es);
+                renderSrcWidget(row, row._srcLocs);
+            });
+            widget.querySelectorAll('.shr-src-del').forEach(function (b) {
+                b.addEventListener('click', function () {
+                    var idx = parseInt(b.getAttribute('data-idx'), 10);
+                    var es = readSrcEntries(row); es.splice(idx, 1);
+                    if (!es.length) es.push({ loc: 0, qty: 0 });
+                    writeSrcEntries(row, es);
+                    renderSrcWidget(row, row._srcLocs);
+                });
+            });
+            recomputeSrc(row);
+        }
+
+        // In-place status recompute — focus-safe so typing a qty doesn't
+        // rebuild the DOM. Sets row._srcOk for the submit-time gate.
+        function recomputeSrc(row) {
+            var widget = row.querySelector('.shr-src-widget');
+            if (!widget) return;
+            var statusEl = widget.querySelector('.shr-src-status');
+            if (!statusEl) return;
+            var availByLoc = {};
+            (row._srcLocs || []).forEach(function (l) { availByLoc[l.id] = l.qty; });
+            var entries = readSrcEntries(row);
+            var need = rowLineQty(row);
+            var alloc = 0, missing = false, perLoc = {};
+            entries.forEach(function (e) {
+                if (e.qty > 0 && !e.loc) missing = true;
+                if (e.loc && e.qty > 0) { alloc += e.qty; perLoc[e.loc] = (perLoc[e.loc] || 0) + e.qty; }
+            });
+            var over = false;
+            Object.keys(perLoc).forEach(function (loc) {
+                if (perLoc[loc] - (availByLoc[loc] || 0) > 0.0001) over = true;
+            });
+            var msg, cls, ok = false;
+            if (missing || alloc <= 0) { msg = 'pick source(s)'; cls = 'muted'; }
+            else if (over) { msg = 'exceeds stock at a location'; cls = 'text-danger'; }
+            else if (need > 0 && Math.abs(alloc - need) > 0.0001) {
+                var d = alloc - need;
+                msg = alloc.toFixed(3) + ' / ' + need.toFixed(3)
+                    + (d < 0 ? ' (short ' + (-d).toFixed(3) + ')' : ' (over ' + d.toFixed(3) + ')');
+                cls = 'text-danger';
+            } else {
+                msg = alloc.toFixed(3) + ' / ' + (need > 0 ? need.toFixed(3) : '?');
+                cls = 'text-success'; ok = (need > 0);
+            }
+            statusEl.className = 'shr-src-status small ' + cls;
+            statusEl.textContent = msg;
+            row._srcOk = ok;
+        }
+
+        // Fetch the item's per-location stock and (re)build the widget.
         function refreshRowSource(row) {
             var kindEl = row.querySelector('.shr-line-kind');
             if (!kindEl || kindEl.value !== 'ship') return;   // receive rows: skip
             var itemEl = row.querySelector('.shr-line-item');
             var itemId = itemEl ? parseInt(itemEl.value || '0', 10) : 0;
-            if (!itemId) { rebuildSourceOptions(row, []); return; }
-            fetchStockByLocation(itemId, function (locs) { rebuildSourceOptions(row, locs); });
+            if (!itemId) { renderSrcWidget(row, []); return; }
+            fetchStockByLocation(itemId, function (locs) { renderSrcWidget(row, locs); });
         }
 
-        // For ship rows, ensure the source select is enabled and styled normally.
-        // Receive rows have no .shr-line-src so this is a no-op for them.
-        function syncRow(row) {
-            var srcSel = row.querySelector('.shr-line-src');
-            if (!srcSel) return;   // receive row — nothing to sync
-            srcSel.disabled = false;
-            srcSel.tabIndex  = 0;
-            var wrap = srcSel.closest('.cb-wrap');
-            if (wrap) {
-                wrap.style.opacity       = '';
-                wrap.style.pointerEvents = '';
-                var visibleInput = wrap.querySelector('input.cb-input');
-                if (visibleInput) visibleInput.tabIndex = 0;
-            }
-            if (window.MagDynCombobox && typeof window.MagDynCombobox.resync === 'function') {
-                window.MagDynCombobox.resync(srcSel);
-            }
-        }
+        // Retained hook — the widget manages its own state now.
+        function syncRow(row) { /* no-op: kept for call sites */ }
 
         function wireRow(row) {
             if (row._wired) return;
             row._wired = true;
             syncRow(row);
 
-            // On first paint (edit mode) refresh source if item is already set.
+            // Build the multi-location source widget for ship rows. New rows
+            // with no item yet render a "pick an item first" hint; the widget
+            // refetches stock + rebuilds whenever the item changes.
             var kindEl  = row.querySelector('.shr-line-kind');
             var itemEl  = row.querySelector('.shr-line-item');
-            if (kindEl && kindEl.value === 'ship' && itemEl && parseInt(itemEl.value || '0', 10) > 0) {
-                refreshRowSource(row);
-            }
+            var isShip  = kindEl && kindEl.value === 'ship';
+            if (isShip) refreshRowSource(row);
 
-            // Kind is fixed per section (hidden input) — no change listener needed.
-            if (itemEl) {
-                itemEl.addEventListener('change', function () { refreshRowSource(row); });
+            if (itemEl && isShip) {
+                itemEl.addEventListener('change', function () {
+                    writeSrcEntries(row, []);   // entries from the old item no longer apply
+                    refreshRowSource(row);
+                });
+            }
+            var qtyEl = row.querySelector('input[name="line_qty[]"]');
+            if (qtyEl && isShip) {
+                qtyEl.addEventListener('input', function () { recomputeSrc(row); });
             }
 
             row.querySelector('.shr-line-remove').addEventListener('click', function () {
@@ -2699,6 +2962,12 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
             // Reset line_id to 0 so save handler INSERTs instead of UPDATEs.
             var lidInput = tmpl.querySelector('input[name="line_id[]"]');
             if (lidInput) lidInput.value = '0';
+            // Clear any inherited source split — the new row starts empty and
+            // wireRow rebuilds the widget once an item is chosen.
+            var srcJson = tmpl.querySelector('.shr-src-json');
+            if (srcJson) srcJson.value = '[]';
+            var srcWidget = tmpl.querySelector('.shr-src-widget');
+            if (srcWidget) srcWidget.innerHTML = '';
             tmpl.querySelectorAll('select').forEach(function (sel) {
                 sel.classList.remove('cb-bound', 'cb-native');
                 sel.disabled     = false;
@@ -2777,26 +3046,48 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
             if (window.MagDynCombobox && typeof window.MagDynCombobox.initAll === 'function') {
                 window.MagDynCombobox.initAll(row);
             }
-            // Set source BEFORE item so rebuildSourceOptions preserves the value.
-            if (spec.srcId && spec.kind === 'ship') setRowField(row, '.shr-line-src', spec.srcId);
             setRowField(row, '.shr-line-item', spec.itemId || '');
             setRowField(row, 'input[name="line_qty[]"]', spec.qty || '');
-            syncRow(row);
+            // Seed a single source entry from the checklist pick, then rebuild
+            // the widget so it fetches the item's stock and renders the entry.
+            if (spec.kind === 'ship') {
+                if (spec.srcId) {
+                    writeSrcEntries(row, [{ loc: parseInt(spec.srcId, 10), qty: parseFloat(spec.qty) || 0 }]);
+                }
+                refreshRowSource(row);
+            }
             return row;
         };
 
-        // Pre-submit diagnostic.
+        // Pre-submit diagnostic + source-split gate.
         var mainForm = document.getElementById('shr-main-form');
         if (mainForm) {
-            mainForm.addEventListener('submit', function () {
+            mainForm.addEventListener('submit', function (ev) {
                 var k = mainForm.querySelectorAll('input[name="line_kind[]"]');
                 var i = mainForm.querySelectorAll('select[name="line_item_id[]"]');
                 var q = mainForm.querySelectorAll('input[name="line_qty[]"]');
-                var s = mainForm.querySelectorAll('[name="line_src_location_id[]"]');
+                var s = mainForm.querySelectorAll('[name="line_src_json[]"]');
                 console.log('[shiprcpt submit] kinds=' + k.length +
                             ' items=' + i.length + ' qtys=' + q.length + ' srcs=' + s.length);
-                console.log('[shiprcpt submit] kinds:',
-                    Array.from(k).map(function (e) { return e.value; }).join(','));
+
+                // Block submit if any ship line's sources don't sum to its qty.
+                // The server re-validates; this is fast feedback. We only flag
+                // ship rows that actually have an item picked.
+                var bad = [];
+                (shipBody ? shipBody.querySelectorAll('tr.shr-line-row') : []).forEach(function (row) {
+                    var itemEl = row.querySelector('.shr-line-item');
+                    var itemId = itemEl ? parseInt(itemEl.value || '0', 10) : 0;
+                    var sub    = row.getAttribute('data-subtype');
+                    if (!itemId || sub !== 'item') return;   // asset / pending / blank rows: no source
+                    if (rowLineQty(row) <= 0) return;
+                    recomputeSrc(row);
+                    if (!row._srcOk) bad.push(itemId);
+                });
+                if (bad.length) {
+                    ev.preventDefault();
+                    alert('Each ship line must allocate its full quantity across one or more source '
+                        + 'locations (and not exceed the stock at any). Check the highlighted Source cells.');
+                }
             });
         }
     })();
@@ -3246,6 +3537,22 @@ if ($action === 'view') {
           ORDER BY sl.line_kind, sl.sort_order, sl.id',
         [$id]
     );
+    // Per-line source split for display (multi-location pick). Keyed by line id.
+    $srcByLineView = [];
+    foreach (db_all(
+        'SELECT s.shipment_line_id, s.qty, l.name AS loc_name
+           FROM inv_shipment_line_sources s
+           JOIN locations l ON l.id = s.location_id
+          WHERE s.shipment_line_id IN (
+                SELECT id FROM inv_shipment_lines WHERE shipment_id = ?)
+          ORDER BY s.id',
+        [$id]
+    ) as $r) {
+        $srcByLineView[(int)$r['shipment_line_id']][] = [
+            'name' => $r['loc_name'],
+            'qty'  => (float)$r['qty'],
+        ];
+    }
     $receipts = db_all(
         'SELECT r.*, sl.item_id, i.code AS item_code,
                 COALESCE(NULLIF(i.short_description, ""), i.name, sl.pending_name) AS item_label,
@@ -3518,8 +3825,19 @@ if ($action === 'view') {
                             <?php endif; ?>
                         </td>
                         <td>
-                            <?php if ($L['line_kind'] === 'ship'): ?>
-                                <?= h($L['src_location_name'] ?: '—') ?>
+                            <?php if ($L['line_kind'] === 'ship'):
+                                $srcRows = $srcByLineView[(int)$L['id']] ?? [];
+                                if (count($srcRows) > 1): ?>
+                                    <?php foreach ($srcRows as $sr): ?>
+                                        <div><?= h($sr['name']) ?>
+                                            <span class="muted small">(<?= h(rtrim(rtrim(number_format($sr['qty'], 3, '.', ''), '0'), '.')) ?>)</span>
+                                        </div>
+                                    <?php endforeach; ?>
+                                <?php elseif (count($srcRows) === 1): ?>
+                                    <?= h($srcRows[0]['name']) ?>
+                                <?php else: ?>
+                                    <?= h($L['src_location_name'] ?: '—') ?>
+                                <?php endif; ?>
                             <?php else: ?>
                                 <span class="muted">—</span>
                             <?php endif; ?>
@@ -3616,13 +3934,13 @@ if ($action === 'view') {
                     <!-- Receive line spans full width on its own row -->
                     <div class="field" style="grid-column: 1 / -1;">
                         <label>Receive line</label>
-                        <select name="shipment_line_id" required>
+                        <select name="shipment_line_id" id="shr-receive-line" required>
                             <option value="">—</option>
                             <?php foreach ($lines as $L):
                                 if ($L['line_kind'] !== 'receive') continue;
                                 $rem = max(0, (float)$L['qty_planned'] - (float)$L['qty_received']);
                             ?>
-                                <option value="<?= (int)$L['id'] ?>">
+                                <option value="<?= (int)$L['id'] ?>" data-open="<?= h(number_format($rem, 3, '.', '')) ?>">
                                     <?= h($L['item_code']) ?> — open: <?= h(rtrim(rtrim(number_format($rem, 3, '.', ''), '0'), '.')) ?> <?= h($L['item_uom']) ?>
                                 </option>
                             <?php endforeach; ?>
@@ -3630,7 +3948,8 @@ if ($action === 'view') {
                     </div>
                     <div class="field">
                         <label>Qty</label>
-                        <input type="number" step="0.001" min="0.001" name="qty_received" required placeholder="0">
+                        <input type="number" step="0.001" min="0.001" name="qty_received" id="shr-qty-received" required placeholder="0">
+                        <small class="muted" id="shr-qty-hint" style="display:none;"></small>
                     </div>
                     <div class="field">
                         <label>Price (each)</label>
@@ -3647,9 +3966,10 @@ if ($action === 'view') {
                     <div class="field">
                         <label>Destination</label>
                         <div class="muted small" style="padding: 6px 0;">
-                            All receipts land at <strong>LOC-QCH</strong> (Quality Check Hold)
-                            pending inspection. The store team routes from there once the
-                            inspection is approved.
+                            Items with an inspection template land at <strong>LOC-QCH</strong>
+                            (Quality Check Hold) pending inspection — the store team routes from
+                            there once it's approved. Items with no template are added straight
+                            to stores (<strong>ST-HLD</strong>) with no inspection.
                         </div>
                         <input type="hidden" name="dst_location_id" value="">
                     </div>
@@ -3661,6 +3981,42 @@ if ($action === 'view') {
                         <button type="submit" class="btn btn-primary">Record</button>
                     </div>
                 </form>
+                <script>
+                (function () {
+                    var sel  = document.getElementById('shr-receive-line');
+                    var qty  = document.getElementById('shr-qty-received');
+                    var hint = document.getElementById('shr-qty-hint');
+                    if (!sel || !qty) return;
+                    function openQty() {
+                        var opt = sel.options[sel.selectedIndex];
+                        var v = opt ? parseFloat(opt.getAttribute('data-open')) : NaN;
+                        return isNaN(v) ? null : v;
+                    }
+                    function sync() {
+                        var open = openQty();
+                        if (open === null) {
+                            qty.removeAttribute('max');
+                            if (hint) hint.style.display = 'none';
+                            qty.setCustomValidity('');
+                            return;
+                        }
+                        qty.max = open;
+                        if (hint) {
+                            hint.textContent = 'Open: ' + open + ' max';
+                            hint.style.display = '';
+                        }
+                        var entered = parseFloat(qty.value);
+                        if (!isNaN(entered) && entered > open + 0.0001) {
+                            qty.setCustomValidity('Qty cannot exceed the open quantity (' + open + ').');
+                        } else {
+                            qty.setCustomValidity('');
+                        }
+                    }
+                    sel.addEventListener('change', sync);
+                    qty.addEventListener('input', sync);
+                    sync();
+                })();
+                </script>
             <?php endif; ?>
         </div>
     <?php endif; ?>
@@ -3787,7 +4143,8 @@ $baseUnion = "
           (SELECT COUNT(*) FROM inv_receipts r2      WHERE r2.shipment_id = sh.id) AS receipt_count,
           (SELECT po_no FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_no,
           (SELECT id    FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_id,
-          sl.old_transaction_id                AS old_transaction_id
+          sl.old_transaction_id                AS old_transaction_id,
+          r.txn_id                             AS inv_txn_id
         FROM inv_receipts r
         JOIN inv_shipments sh        ON sh.id = r.shipment_id
         JOIN inv_shipment_lines sl   ON sl.id = r.shipment_line_id
@@ -3827,7 +4184,11 @@ $baseUnion = "
           (SELECT COUNT(*) FROM inv_receipts r2      WHERE r2.shipment_id = sh.id) AS receipt_count,
           (SELECT po_no FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_no,
           (SELECT id    FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_id,
-          sl.old_transaction_id                AS old_transaction_id
+          sl.old_transaction_id                AS old_transaction_id,
+          -- Ship-out txns aren't 1:1 with a ship line (a line can split
+          -- across several source locations → several ship_out txns), so
+          -- there's no single internal txn id to surface here.
+          NULL                                 AS inv_txn_id
         FROM inv_shipment_lines sl
         JOIN inv_shipments sh        ON sh.id = sl.shipment_id
    LEFT JOIN inv_items i             ON i.id  = sl.item_id
@@ -3877,7 +4238,8 @@ $baseUnion = "
           (SELECT COUNT(*) FROM inv_receipts r2      WHERE r2.shipment_id = sh.id) AS receipt_count,
           (SELECT po_no FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_no,
           (SELECT id    FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_id,
-          sl.old_transaction_id                AS old_transaction_id
+          sl.old_transaction_id                AS old_transaction_id,
+          NULL                                 AS inv_txn_id
         FROM inv_shipment_lines sl
         JOIN inv_shipments sh    ON sh.id = sl.shipment_id
    LEFT JOIN inv_items i         ON i.id  = sl.item_id
@@ -3929,7 +4291,9 @@ $baseUnion = "
           (SELECT COUNT(*) FROM inv_receipts r2      WHERE r2.shipment_id = sh.id) AS receipt_count,
           (SELECT po_no FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_no,
           (SELECT id    FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_id,
-          sl.old_transaction_id                AS old_transaction_id
+          sl.old_transaction_id                AS old_transaction_id,
+          -- Imported received receipts are audit-only — no inv_txns row.
+          NULL                                 AS inv_txn_id
         FROM inv_shipment_lines sl
         JOIN inv_shipments sh        ON sh.id = sl.shipment_id
    LEFT JOIN inv_items i             ON i.id  = sl.item_id
@@ -3982,6 +4346,11 @@ $dtCfg = [
         ['key'=>'ship_no',       'label'=>'Ship #',       'sortable'=>true, 'searchable'=>true,  'sql_col'=>'e.ship_no'],
         ['key'=>'po_no',         'label'=>'PO #',         'sortable'=>true, 'searchable'=>true,  'sql_col'=>'e.po_no'],
         ['key'=>'old_txn',       'label'=>'Txn ID',       'sortable'=>true, 'searchable'=>true,  'sql_col'=>'e.old_transaction_id', 'th_class'=>'r','td_class'=>'r'],
+        // Internal transaction id — the same "Txn ID" shown on the
+        // Transaction history page (inv_txns.id). Only receipt events are
+        // 1:1 with an inv_txns row (via inv_receipts.txn_id); other rows
+        // show "—".
+        ['key'=>'inv_txn_id',    'label'=>'Internal Txn ID', 'sortable'=>true, 'searchable'=>true,  'sql_col'=>'e.inv_txn_id', 'th_class'=>'r','td_class'=>'r'],
         ['key'=>'vendor',        'label'=>'Vendor',       'sortable'=>true, 'searchable'=>true,  'sql_col'=>'e.vendor_name'],
         ['key'=>'item_label',    'label'=>'Item',         'sortable'=>true, 'searchable'=>true,
          // Searchable on both code and name; displayed as (CODE)-Name
@@ -4180,6 +4549,12 @@ $rowRenderer = function ($r) use ($canManage, &$shipmentNoteCounts) {
         'po_no'         => $poCell,
         'old_txn'       => !empty($r['old_transaction_id'])
             ? '<code title="Legacy inventory_transaction.inventory_transaction_id">' . (int)$r['old_transaction_id'] . '</code>'
+            : '<span class="muted">—</span>',
+        // Internal inv_txns.id — links to the Transaction history page where
+        // this same id shows as the "Txn ID". Only present for receipt events.
+        'inv_txn_id'    => !empty($r['inv_txn_id'])
+            ? '<a href="' . h(url('/inventory.php?action=txn_history&dt_q=' . (int)$r['inv_txn_id']))
+              . '" title="View in Transaction history"><code>#' . (int)$r['inv_txn_id'] . '</code></a>'
             : '<span class="muted">—</span>',
         'vendor'        => $vendor,
         'item_label'    => $itemCell,

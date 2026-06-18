@@ -299,14 +299,55 @@ if ($action === 'txn_process') {
     $refDoc    = trim((string)input('ref_doc')) ?: null;
     $notes     = trim((string)input('notes'))   ?: null;
 
-    // Per-child-line source map: child_source[<bom_line_id>] = location_id.
-    // The user must pick a source for every line of the target's BOM unless
-    // it's a direct addition or leaf-item.
+    // Per-child-line source split. The form posts two parallel arrays keyed
+    // by BOM line id, each holding one entry per source location the operator
+    // chose for that line:
+    //   child_source[<bom_line_id>][] = location_id
+    //   child_qty[<bom_line_id>][]    = qty drawn from that location
+    // A line with a single source is just a one-element split. The user must
+    // cover every BOM line (sum == required) unless it's a direct addition or
+    // a leaf-item build.
     $childSourceRaw = isset($_POST['child_source']) && is_array($_POST['child_source'])
         ? $_POST['child_source'] : [];
-    $childSource = [];
-    foreach ($childSourceRaw as $lineId => $locId) {
-        $childSource[(int)$lineId] = (int)$locId;
+    $childQtyRaw    = isset($_POST['child_qty']) && is_array($_POST['child_qty'])
+        ? $_POST['child_qty'] : [];
+    // $childSplit[<line_id>] = [ ['loc' => locId, 'qty' => qty], ... ]
+    $childSplit = [];
+    foreach ($childSourceRaw as $lineId => $locs) {
+        $lineId = (int)$lineId;
+        $locs   = (array)$locs;
+        $qtys   = isset($childQtyRaw[$lineId]) ? (array)$childQtyRaw[$lineId] : [];
+        $entries = [];
+        foreach ($locs as $k => $locId) {
+            $locId = (int)$locId;
+            $eqty  = isset($qtys[$k]) ? (float)$qtys[$k] : 0.0;
+            if ($locId <= 0 || $eqty <= 0) continue;   // drop blank / zero rows
+            $entries[] = ['loc' => $locId, 'qty' => $eqty];
+        }
+        if ($entries) $childSplit[$lineId] = $entries;
+    }
+
+    // Guard: held locations (LOC-LIP / LOC-SMP) may never be a consumption
+    // source — their stock is add/move only. The per-line picker already
+    // excludes them; this rejects a hand-crafted POST that tries anyway.
+    if ($childSplit) {
+        $heldInList = inv_held_location_codes_sql();
+        $heldIds = [];
+        foreach (db_all(
+            "SELECT id FROM locations
+              WHERE code COLLATE utf8mb4_unicode_ci IN ($heldInList)"
+        ) as $hr) {
+            $heldIds[(int)$hr['id']] = true;
+        }
+        foreach ($childSplit as $entries) {
+            foreach ($entries as $e) {
+                if (isset($heldIds[$e['loc']])) {
+                    flash_set('error', 'Held stock (Lost In Process / Sample) cannot be '
+                        . 'consumed in a build. Move it to an available location first.');
+                    redirect(url('/inventory.php?action=process'));
+                }
+            }
+        }
     }
 
     $errors = [];
@@ -317,15 +358,28 @@ if ($action === 'txn_process') {
         redirect(url('/inventory.php?action=process'));
     }
 
-    // Force destination to LOC-QCH (Quality Check Hold). All process
-    // header txns land here pending inspection; the inspection's
-    // approval routes the qty out to the appropriate location.
+    // Destination is decided server-side by whether the produced item
+    // carries an active inspection template. With a template the header
+    // txn lands at LOC-QCH (Quality Check Hold) pending inspection and an
+    // inspection is auto-created; the inspection's approval routes the
+    // qty out to the final location. Without a template the qty is added
+    // straight to stores (ST-HLD) and no inspection is created.
     $qchId = qc_loc_id('LOC-QCH');
     if (!$qchId) {
         flash_set('error', 'LOC-QCH location is missing. Run the migration that seeds it.');
         redirect(url('/inventory.php?action=process'));
     }
-    $dstLocId = $qchId;
+    $procTplId = qc_item_template_id($productId);
+    if ($procTplId) {
+        $dstLocId = $qchId;
+    } else {
+        $stHldId = qc_loc_id('ST-HLD');
+        if (!$stHldId) {
+            flash_set('error', 'ST-HLD (stores) location is missing. Run the migration that seeds it.');
+            redirect(url('/inventory.php?action=process'));
+        }
+        $dstLocId = $stHldId;
+    }
 
     $product = db_one('SELECT * FROM inv_items WHERE id = ?', [$productId]);
     if (!$product) {
@@ -382,18 +436,35 @@ if ($action === 'txn_process') {
         [$productId]
     );
 
-    // Validate that EVERY child line has been given a source location.
-    // We ask the user to pick explicitly per the chosen design — no
-    // implicit default. Empty source for any line is a hard error.
+    // Validate that EVERY child line has at least one source, and that the
+    // per-location quantities sum EXACTLY to the line's required quantity
+    // (line_qty * build qty). We ask the user to pick explicitly per the
+    // chosen design — no implicit default. A missing source or a sum that
+    // doesn't match required is a hard error.
     if ($lines) {
-        $missing = [];
+        $missing  = [];
+        $mismatch = [];
         foreach ($lines as $L) {
-            if (empty($childSource[(int)$L['id']])) {
+            $entries = $childSplit[(int)$L['id']] ?? [];
+            if (!$entries) {
                 $missing[] = $L['code'];
+                continue;
+            }
+            $required = (float)$L['line_qty'] * $qty;
+            $alloc    = 0.0;
+            foreach ($entries as $e) $alloc += $e['qty'];
+            if (abs($alloc - $required) > 0.0001) {
+                $mismatch[] = sprintf('%s (need %g, allocated %g)', $L['code'], $required, $alloc);
             }
         }
         if ($missing) {
             flash_set('error', 'Pick a source location for each line. Missing: ' . implode(', ', $missing));
+            redirect(url('/inventory.php?action=process&product_id=' . $productId
+                . '&dst_location_id=' . $dstLocId));
+        }
+        if ($mismatch) {
+            flash_set('error', 'Source quantities must sum to the required quantity for each line. '
+                . 'Off on: ' . implode('; ', $mismatch));
             redirect(url('/inventory.php?action=process&product_id=' . $productId
                 . '&dst_location_id=' . $dstLocId));
         }
@@ -402,9 +473,31 @@ if ($action === 'txn_process') {
     try {
         db()->beginTransaction();
 
+        // Resolve done_by employee IDs (users_info) + names up-front. The
+        // names are stamped into the header note ("Process done by …") as
+        // well as persisted to inv_txn_done_by below. Reads the multi-select
+        // POST `done_by[]`; unknown / duplicate IDs are silently dropped.
+        $doneByRaw = isset($_POST['done_by']) ? (array)$_POST['done_by'] : [];
+        $doneBy    = array_values(array_unique(array_filter(array_map('intval', $doneByRaw))));
+        $doneByNames = [];
+        if ($doneBy) {
+            $ph   = implode(',', array_fill(0, count($doneBy), '?'));
+            $rows = db_all("SELECT id, name FROM users_info WHERE id IN ($ph)", $doneBy);
+            $nameById = [];
+            foreach ($rows as $r) $nameById[(int)$r['id']] = $r['name'];
+            // Preserve the order the user picked them in.
+            foreach ($doneBy as $eid) {
+                if (isset($nameById[$eid])) $doneByNames[] = $nameById[$eid];
+            }
+        }
+
         // 1. Increment the produced item at the DESTINATION location.
-        $headerNote = $notes;
-        if (!$headerNote) {
+        //    Header note = "Process done by <names>" + the user's notes.
+        $noteParts = [];
+        if ($doneByNames) $noteParts[] = 'Process done by ' . implode(', ', $doneByNames);
+        if ($notes)       $noteParts[] = $notes;
+        $headerNote = implode(' — ', $noteParts);
+        if ($headerNote === '') {
             if ($directAddition) {
                 $headerNote = 'Direct addition: ' . $qty . ' x ' . $product['code'];
             } elseif ($reworkFlag) {
@@ -421,11 +514,7 @@ if ($action === 'txn_process') {
             null, $refDoc, $headerNote
         );
 
-        // Persist done_by: zero or more user IDs attached to the header
-        // txn. Reads from the multi-select POST `done_by[]`. Silently
-        // ignores duplicates and unknown IDs (FK + PK enforce sanity).
-        $doneByRaw = isset($_POST['done_by']) ? (array)$_POST['done_by'] : [];
-        $doneBy    = array_values(array_unique(array_filter(array_map('intval', $doneByRaw))));
+        // Persist done_by rows (PK on (txn_id, user_id) dedupes).
         foreach ($doneBy as $uid) {
             db_exec(
                 'INSERT IGNORE INTO inv_txn_done_by (txn_id, user_id) VALUES (?, ?)',
@@ -445,47 +534,58 @@ if ($action === 'txn_process') {
                 'Rework consumption: ' . $product['code'] . ' x ' . $qty
             );
         } else {
-            // 2b. Cascade child consumption. Each line uses its OWN source
-            //     location (per-line override per the new design). The
+            // 2b. Cascade child consumption. Each line can be split across
+            //     several source locations (per-line multi-source per the new
+            //     design); we post one consumption txn PER source entry. The
             //     cascade rows in inv_txns each carry their own location_id,
             //     so the ledger view will correctly show which location lost
             //     stock for each subpart.
             foreach ($lines as $L) {
-                $srcLocId = (int)$childSource[(int)$L['id']];
-                $consume  = (float)$L['line_qty'] * $qty;
-                inv_post_txn(
-                    'process', $txnDate,
-                    (int)$L['child_item_id'], $srcLocId, -$consume,
-                    $header['txn_id'], $refDoc,
-                    'Consumed for ' . $product['code'] . ' x ' . $qty
-                );
+                $entries = $childSplit[(int)$L['id']] ?? [];
+                foreach ($entries as $e) {
+                    inv_post_txn(
+                        'process', $txnDate,
+                        (int)$L['child_item_id'], (int)$e['loc'], -(float)$e['qty'],
+                        $header['txn_id'], $refDoc,
+                        'Consumed for ' . $product['code'] . ' x ' . $qty
+                    );
+                }
             }
         }
 
-        // 3. Auto-create the QC inspection for this header txn. It lands
-        //    in 'draft' status and shows up in the pending QC list. We do
-        //    this BEFORE commit so a failure in inspection-create rolls
-        //    back the stock move too — keeping the ledger consistent with
-        //    the inspection queue.
-        $inspectionId = qc_auto_create_inspection_for_txn((int)$header['txn_id']);
+        // 3. Auto-create the QC inspection for this header txn, but only
+        //    when the item has an inspection template. It lands in 'draft'
+        //    status and shows up in the pending QC list. We do this BEFORE
+        //    commit so a failure in inspection-create rolls back the stock
+        //    move too — keeping the ledger consistent with the inspection
+        //    queue. Template-less items went straight to stores (ST-HLD)
+        //    above and need no inspection.
+        $inspectionId = $procTplId
+            ? qc_auto_create_inspection_for_txn((int)$header['txn_id'])
+            : 0;
 
         db()->commit();
         $modeTag = $directAddition
             ? ' [direct]'
             : ($reworkFlag ? ' [rework]' : ($lines ? ' [per-line sources]' : ' [leaf]'));
-        $auditDetails = sprintf('%s x %g into LOC-QCH%s · inspection #%d',
-            $product['code'], $qty, $modeTag, $inspectionId);
+        $destCode = $procTplId ? 'LOC-QCH' : 'ST-HLD';
+        $auditDetails = $procTplId
+            ? sprintf('%s x %g into LOC-QCH%s · inspection #%d',
+                $product['code'], $qty, $modeTag, $inspectionId)
+            : sprintf('%s x %g into ST-HLD%s · no template, QC skipped',
+                $product['code'], $qty, $modeTag);
         db_exec("INSERT INTO audit_log (actor_id, action, target_id, details) VALUES (?, 'inventory.process', ?, ?)",
             [current_user_id(), $productId, $auditDetails]);
+        $landing = $procTplId
+            ? 'Landed at LOC-QCH pending inspection.'
+            : 'Added to stores (ST-HLD). No template — QC skipped.';
         if ($reworkFlag) {
-            $msg = sprintf('Reworked %g x %s. Landed at LOC-QCH pending inspection.',
-                $qty, $product['code']);
+            $msg = sprintf('Reworked %g x %s. %s', $qty, $product['code'], $landing);
         } elseif ($lines) {
-            $msg = sprintf('Processed %g x %s. Landed at LOC-QCH pending inspection.',
-                $qty, $product['code']);
+            $msg = sprintf('Processed %g x %s. %s', $qty, $product['code'], $landing);
         } else {
-            $msg = sprintf('Added %g x %s%s. Landed at LOC-QCH pending inspection.',
-                $qty, $product['code'], $directAddition ? ' (direct addition)' : '');
+            $msg = sprintf('Added %g x %s%s. %s',
+                $qty, $product['code'], $directAddition ? ' (direct addition)' : '', $landing);
         }
         flash_set('success', $msg);
         redirect(url('/inventory.php?action=ledger&id=' . $productId));
@@ -809,7 +909,29 @@ if ($action === 'process') {
           WHERE i.is_active = 1
        ORDER BY i.code"
     );
-    $locs = db_all('SELECT id, code, name FROM locations WHERE is_active = 1 ORDER BY sort_order, name');
+    // Which products carry an active inspection template. Drives the live
+    // preview wording: templated items land in QC Hold pending inspection,
+    // template-less items are added straight to stores.
+    $tplItemIds = [];
+    foreach (db_all(
+        "SELECT DISTINCT tt.entity_id AS id
+           FROM inspection_template_targets tt
+           JOIN inspection_templates t ON t.id = tt.template_id AND t.is_active = 1
+          WHERE tt.entity_type = 'inv_item'"
+    ) as $r) {
+        $tplItemIds[(string)(int)$r['id']] = true;
+    }
+
+    // Source-location options for the per-child-line pickers. Held
+    // locations (LOC-LIP / LOC-SMP) are excluded — their stock is tracked
+    // but can never be consumed in a build, only added to or moved.
+    $heldInList = inv_held_location_codes_sql();
+    $locs = db_all(
+        "SELECT id, code, name FROM locations
+          WHERE is_active = 1
+            AND code COLLATE utf8mb4_unicode_ci NOT IN ($heldInList)
+          ORDER BY sort_order, name"
+    );
     $preProduct = (int)input('product_id', 0);
     $preDstLoc  = (int)input('dst_location_id', 0);
 
@@ -845,15 +967,15 @@ if ($action === 'process') {
         $locsForJs[] = ['id' => (int)$l['id'], 'name' => $l['name'], 'code' => $l['code']];
     }
 
-    // Active users for the "Done by" multi-select. Includes the current
-    // user pre-selected so the common one-person case requires no clicks.
+    // Active employees (users_info) for the "Done by" multi-select. These
+    // are shop-floor / staff names (not login accounts), managed under
+    // Admin ▸ Employees. status = 1 means active.
     $activeUsers = db_all(
-        "SELECT id, full_name, email
-           FROM users
-          WHERE is_active = 1
-          ORDER BY full_name, email"
+        "SELECT id, name
+           FROM users_info
+          WHERE status = 1
+          ORDER BY name"
     );
-    $currentUid = current_user_id();
 
     $page_title  = 'Process inventory';
     $page_module = 'inventory_process';
@@ -902,9 +1024,10 @@ if ($action === 'process') {
                     <div class="field">
                         <label>Destination</label>
                         <div class="muted small" style="padding: 6px 0;">
-                            All process txns land at <strong>LOC-QCH</strong> (Quality Check Hold)
-                            pending inspection. The inspection's approval routes the qty out to
-                            the appropriate location automatically.
+                            Items with an inspection template land at <strong>LOC-QCH</strong>
+                            (Quality Check Hold) pending inspection, and the inspection's approval
+                            routes the qty out automatically. Items with no template are added
+                            straight to stores (<strong>ST-HLD</strong>) with no inspection.
                         </div>
                         <input type="hidden" name="dst_location_id" value="">
                     </div>
@@ -922,16 +1045,14 @@ if ($action === 'process') {
                     <div class="field">
                         <label for="f_done_by">Done by</label>
                         <select id="f_done_by" name="done_by[]" multiple class="chips" tabindex="6"
-                                data-placeholder="Pick one or more users…">
-                            <?php foreach ($activeUsers as $u):
-                                $sel = (int)$u['id'] === (int)$currentUid;
-                            ?>
-                                <option value="<?= (int)$u['id'] ?>" <?= $sel ? 'selected' : '' ?>>
-                                    <?= h($u['full_name'] ?: $u['email']) ?>
+                                data-placeholder="Pick one or more employees…">
+                            <?php foreach ($activeUsers as $u): ?>
+                                <option value="<?= (int)$u['id'] ?>">
+                                    <?= h($u['name']) ?>
                                 </option>
                             <?php endforeach; ?>
                         </select>
-                        <span class="muted small">Logged-in user is pre-selected. Add others as needed.</span>
+                        <span class="muted small">Pick the employee(s) who performed this process. Manage the list under Admin ▸ Employees.</span>
                     </div>
 
                     <div class="field">
@@ -977,11 +1098,20 @@ if ($action === 'process') {
         var preview = <?= json_encode($preview) ?>;
         var stock   = <?= json_encode($stockAt) ?>;
         var locs    = <?= json_encode($locsForJs) ?>;
+        // item id -> true when the item has an active inspection template.
+        var hasTpl  = <?= json_encode((object)$tplItemIds) ?>;
+        // Phrase the landing spot for the preview based on template status.
+        function landingPhrase(pid) {
+            return hasTpl[pid]
+                ? '<strong>LOC-QCH</strong> pending inspection'
+                : 'stores (<strong>ST-HLD</strong>) with no inspection';
+        }
         var selP = document.getElementById('f_product');
         var inpQ = document.getElementById('f_qty');
         // selL was the destination-location picker. The destination is
-        // now forced to LOC-QCH server-side, so the picker was replaced
-        // with a static notice and there's no `f_loc` element to read.
+        // now decided server-side (LOC-QCH when the item has an inspection
+        // template, else stores/ST-HLD), so the picker was replaced with a
+        // static notice and there's no `f_loc` element to read.
         var box  = document.getElementById('process-preview');
         var btn  = document.getElementById('f_submit');
         var chkD = document.getElementById('f_direct');
@@ -995,10 +1125,11 @@ if ($action === 'process') {
             if (locs[li].code === 'I-Rework') { reworkLoc = locs[li]; break; }
         }
 
-        // Remember user's per-line source pick across re-renders. Keyed by
-        // BOM line_id, value is the chosen location_id (number). When the
-        // user changes the product, this map is wiped — it only makes
-        // sense to retain picks for the lines currently in view.
+        // Remember user's per-line source split across re-renders. Keyed by
+        // BOM line_id, value is an array of { loc: location_id, qty: number }
+        // entries — one per source location the operator drew from. When the
+        // user changes the product, this map is wiped — it only makes sense
+        // to retain picks for the lines currently in view.
         var sourceMap = {};
         var lastProductId = null;
 
@@ -1082,7 +1213,7 @@ if ($action === 'process') {
                     : '';
                 var prefix = autoHint
                     + 'Rework selected. <strong>' + qty.toFixed(3) + '</strong> of this item will be consumed from <strong>'
-                    + escape(reworkLoc.name) + '</strong> (' + escape(reworkLoc.code) + ') and added at <strong>LOC-QCH</strong> pending inspection.';
+                    + escape(reworkLoc.name) + '</strong> (' + escape(reworkLoc.code) + ') and added at ' + landingPhrase(pid) + '.';
                 if (!qty || qty <= 0) {
                     box.innerHTML = prefix + '<br><span class="muted">Enter a quantity to produce.</span>';
                     btn.disabled = false;
@@ -1105,13 +1236,13 @@ if ($action === 'process') {
             // Direct-addition path / leaf items: no child consumption.
             if (direct || isLeaf) {
                 var reason = direct
-                    ? 'Direct addition selected. The item\'s stock will be incremented at <strong>LOC-QCH</strong> with no child consumption.'
-                    : 'This item has no BOM. It will be added to stock at <strong>LOC-QCH</strong> as a leaf item, with no child consumption.';
+                    ? 'Direct addition selected. The item\'s stock will be incremented at ' + landingPhrase(pid) + ', with no child consumption.'
+                    : 'This item has no BOM. It will be added to stock at ' + landingPhrase(pid) + ' as a leaf item, with no child consumption.';
                 if (!qty || qty <= 0) {
                     box.innerHTML = reason + '<br><span class="muted">Enter a quantity to produce.</span>';
                 } else {
                     box.innerHTML = reason + '<br><strong>+ ' + qty.toFixed(3)
-                        + '</strong> will be added at LOC-QCH pending inspection.';
+                        + '</strong> will be added at ' + landingPhrase(pid) + '.';
                 }
                 btn.disabled = false;
                 return;
@@ -1123,75 +1254,152 @@ if ($action === 'process') {
                 return;
             }
 
-            // Render the per-line preview table. Each line gets:
-            //   Code · Part · Per parent · Required · Source dropdown · Available · Status
-            // The dropdown is named child_source[<lineId>] so the server
-            // receives a {lineId: locId} map directly via $_POST.
-            var anyShort   = false;
-            var anyMissing = false;
-            var html = '<table class="data-table"><thead><tr>'
-                + '<th>Code</th><th>Part</th><th class="r">Per parent</th>'
-                + '<th class="r">Required</th>'
-                + '<th>Pull from</th>'
-                + '<th class="r">Avail. here</th>'
-                + '<th>Status</th></tr></thead><tbody>';
-            lines.forEach(function (L) {
-                var required  = parseFloat(L.line_qty) * qty;
-                var chosenLoc = sourceMap[L.line_id] || 0;
-                var available = (chosenLoc && stock[L.id] && stock[L.id][chosenLoc])
-                    ? stock[L.id][chosenLoc] : 0;
-                var status, statusClass = '';
-                if (!chosenLoc) {
-                    anyMissing = true;
-                    status = '<span class="muted">— pick source —</span>';
-                } else {
-                    var shortBy = required - available;
-                    if (shortBy > 0.0001) {
-                        anyShort = true;
-                        statusClass = ' class="row-short"';
-                        status = '<span class="text-danger">SHORT by ' + shortBy.toFixed(3) + '</span>';
-                    } else {
-                        status = '<span class="text-success">OK</span>';
-                    }
+            // Render the per-line preview. Each BOM line can pull from one or
+            // more source locations; we show a mini source table per line with
+            // a location picker + qty per row, an "+ add source" button, and a
+            // running allocated-vs-required status. Inputs are named
+            //   child_source[<lineId>][]  and  child_qty[<lineId>][]
+            // so the server receives parallel per-line arrays via $_POST.
+            function entriesFor(lineId) {
+                if (!Array.isArray(sourceMap[lineId]) || !sourceMap[lineId].length) {
+                    sourceMap[lineId] = [{ loc: 0, qty: 0 }];
                 }
-                html += '<tr' + statusClass + '>'
-                    + '<td><code>' + escape(L.code) + '</code></td>'
-                    + '<td>' + escape(L.name) + '</td>'
-                    + '<td class="r">' + parseFloat(L.line_qty).toFixed(3) + ' ' + escape(L.uom || '') + '</td>'
-                    + '<td class="r"><strong>' + required.toFixed(3) + '</strong></td>'
-                    + '<td><select class="proc-source" data-line-id="' + L.line_id + '" '
-                        + 'name="child_source[' + L.line_id + ']" required>'
-                        + renderLocOptions(L.id, chosenLoc) + '</select></td>'
-                    + '<td class="r">' + (chosenLoc ? available.toFixed(3) : '—') + '</td>'
-                    + '<td>' + status + '</td></tr>';
-            });
-            html += '</tbody></table>';
-            if (anyMissing) {
-                html += '<p class="muted small">Pick a source location for every line before posting.</p>';
+                return sourceMap[lineId];
             }
-            if (anyShort) {
-                html += '<p class="text-danger"><strong>Some lines are short.</strong> Pick a different source location, receive stock first, or tick <em>Direct addition</em> to skip consumption.</p>';
-            }
-            box.innerHTML = html;
-            btn.disabled = anyShort || anyMissing;
 
-            // Wire each per-line select to update sourceMap and re-render.
-            // We re-render on change so the Available / Status columns
-            // reflect the new pick. The sourceMap survives because we set
-            // it before refresh() rebuilds the table.
-            box.querySelectorAll('.proc-source').forEach(function (sel) {
+            var html = '';
+            lines.forEach(function (L) {
+                var required = parseFloat(L.line_qty) * qty;
+                var entries  = entriesFor(L.line_id);
+                html += '<div class="proc-line" data-line-id="' + L.line_id
+                      + '" data-item-id="' + L.id + '" data-required="' + required + '">';
+                html += '<div class="proc-line-head" style="margin:10px 0 4px;">'
+                      + '<code>' + escape(L.code) + '</code> — ' + escape(L.name)
+                      + ' <span class="muted small">· ' + parseFloat(L.line_qty).toFixed(3) + ' '
+                      + escape(L.uom || '') + ' per parent</span>'
+                      + ' · need <strong>' + required.toFixed(3) + ' ' + escape(L.uom || '') + '</strong>'
+                      + ' <span class="proc-line-status"></span></div>';
+                html += '<table class="data-table proc-src-table" style="margin:0 0 4px;"><thead><tr>'
+                      + '<th>Pull from</th><th class="r" style="width:120px;">Qty</th>'
+                      + '<th class="r" style="width:90px;">Avail.</th><th style="width:36px;"></th>'
+                      + '</tr></thead><tbody>';
+                entries.forEach(function (e, idx) {
+                    var avail = (e.loc && stock[L.id] && stock[L.id][e.loc]) ? stock[L.id][e.loc] : 0;
+                    html += '<tr>'
+                        + '<td><select class="proc-src-loc" data-line-id="' + L.line_id + '" data-idx="' + idx + '" '
+                            + 'name="child_source[' + L.line_id + '][]">'
+                            + renderLocOptions(L.id, e.loc) + '</select></td>'
+                        + '<td class="r"><input class="proc-src-qty r" type="number" step="0.001" min="0" '
+                            + 'data-line-id="' + L.line_id + '" data-idx="' + idx + '" '
+                            + 'name="child_qty[' + L.line_id + '][]" value="' + (e.qty ? fmtq(e.qty) : '') + '" '
+                            + 'style="width:100%;"></td>'
+                        + '<td class="r proc-src-avail">' + (e.loc ? avail.toFixed(3) : '—') + '</td>'
+                        + '<td class="r">' + (entries.length > 1
+                            ? '<button type="button" class="btn btn-icon btn-danger proc-src-del" '
+                              + 'data-line-id="' + L.line_id + '" data-idx="' + idx + '" title="Remove">🗑</button>'
+                            : '') + '</td>'
+                        + '</tr>';
+                });
+                html += '</tbody></table>';
+                html += '<button type="button" class="btn btn-ghost btn-sm proc-src-add" data-line-id="'
+                      + L.line_id + '">+ add source</button>';
+                html += '</div>';
+            });
+            box.innerHTML = html;
+
+            // recompute() recalculates per-line allocated-vs-required status and
+            // the submit gate WITHOUT rebuilding the DOM, so typing in a qty
+            // input doesn't lose focus. Called on every qty keystroke and once
+            // after each full render. Location changes / add / remove rebuild
+            // via refresh() so the option lists and rows stay consistent.
+            function recompute() {
+                var blockSubmit = false;
+                box.querySelectorAll('.proc-line').forEach(function (lineEl) {
+                    var lineId   = parseInt(lineEl.getAttribute('data-line-id'), 10);
+                    var itemId   = parseInt(lineEl.getAttribute('data-item-id'), 10);
+                    var required = parseFloat(lineEl.getAttribute('data-required')) || 0;
+                    var entries  = sourceMap[lineId] || [];
+                    var alloc = 0, missing = false, perLoc = {};
+                    entries.forEach(function (e) {
+                        if (e.qty > 0 && !e.loc) missing = true;
+                        if (e.loc && e.qty > 0) {
+                            alloc += e.qty;
+                            perLoc[e.loc] = (perLoc[e.loc] || 0) + e.qty;
+                        }
+                    });
+                    var over = false;
+                    Object.keys(perLoc).forEach(function (loc) {
+                        var avail = (stock[itemId] && stock[itemId][loc]) ? stock[itemId][loc] : 0;
+                        if (perLoc[loc] - avail > 0.0001) over = true;
+                    });
+                    var statusEl = lineEl.querySelector('.proc-line-status');
+                    var msg, cls;
+                    if (missing || alloc <= 0) {
+                        msg = '— pick source(s) —'; cls = 'muted'; blockSubmit = true;
+                    } else if (over) {
+                        msg = 'SHORT — exceeds stock at a location'; cls = 'text-danger'; blockSubmit = true;
+                    } else if (Math.abs(alloc - required) > 0.0001) {
+                        var diff = alloc - required;
+                        msg = 'allocated ' + alloc.toFixed(3) + ' / ' + required.toFixed(3)
+                            + (diff < 0 ? ' — short by ' + (-diff).toFixed(3) : ' — over by ' + diff.toFixed(3));
+                        cls = 'text-danger'; blockSubmit = true;
+                    } else {
+                        msg = 'OK — ' + alloc.toFixed(3) + ' / ' + required.toFixed(3); cls = 'text-success';
+                    }
+                    if (statusEl) { statusEl.className = 'proc-line-status ' + cls; statusEl.textContent = ' · ' + msg; }
+                    // Refresh the per-row "Avail." cells from the current picks.
+                    lineEl.querySelectorAll('.proc-src-qty').forEach(function (inp) {
+                        var idx = parseInt(inp.getAttribute('data-idx'), 10);
+                        var e = entries[idx]; if (!e) return;
+                        var availCell = inp.closest('tr').querySelector('.proc-src-avail');
+                        var avail = (e.loc && stock[itemId] && stock[itemId][e.loc]) ? stock[itemId][e.loc] : 0;
+                        if (availCell) availCell.textContent = e.loc ? avail.toFixed(3) : '—';
+                    });
+                });
+                btn.disabled = blockSubmit;
+            }
+
+            // Wire the per-entry controls. Location / add / remove rebuild the
+            // whole preview; qty edits do an in-place recompute (focus-safe).
+            box.querySelectorAll('.proc-src-loc').forEach(function (sel) {
                 sel.addEventListener('change', function () {
                     var lineId = parseInt(sel.getAttribute('data-line-id'), 10);
-                    var locId  = parseInt(sel.value || '0', 10);
-                    if (locId) sourceMap[lineId] = locId;
-                    else       delete sourceMap[lineId];
+                    var idx    = parseInt(sel.getAttribute('data-idx'), 10);
+                    entriesFor(lineId)[idx].loc = parseInt(sel.value || '0', 10);
                     refresh();
                 });
             });
+            box.querySelectorAll('.proc-src-qty').forEach(function (inp) {
+                inp.addEventListener('input', function () {
+                    var lineId = parseInt(inp.getAttribute('data-line-id'), 10);
+                    var idx    = parseInt(inp.getAttribute('data-idx'), 10);
+                    entriesFor(lineId)[idx].qty = parseFloat(inp.value || '0') || 0;
+                    recompute();
+                });
+            });
+            box.querySelectorAll('.proc-src-add').forEach(function (b) {
+                b.addEventListener('click', function () {
+                    var lineId = parseInt(b.getAttribute('data-line-id'), 10);
+                    entriesFor(lineId).push({ loc: 0, qty: 0 });
+                    refresh();
+                });
+            });
+            box.querySelectorAll('.proc-src-del').forEach(function (b) {
+                b.addEventListener('click', function () {
+                    var lineId = parseInt(b.getAttribute('data-line-id'), 10);
+                    var idx    = parseInt(b.getAttribute('data-idx'), 10);
+                    var arr = entriesFor(lineId);
+                    arr.splice(idx, 1);
+                    if (!arr.length) arr.push({ loc: 0, qty: 0 });
+                    refresh();
+                });
+            });
+            recompute();
         }
         function escape(s) { return String(s).replace(/[&<>"]/g, function (c) {
             return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c];
         }); }
+        function fmtq(n) { return (Math.round(n * 1000) / 1000).toString(); }
 
         selP.addEventListener('change', refresh);
         inpQ.addEventListener('input',  refresh);

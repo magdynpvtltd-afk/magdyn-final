@@ -50,8 +50,12 @@
 //
 // IDEMPOTENCY
 // -----------
-// Items keyed on `code`: pre-existing items are reused, never modified
-// by the importer. Edges keyed on (parent_id, child_id) with no
+// Items keyed on `code`: pre-existing items are UPDATED in place — every
+// import-sourced field (descriptions, dwg/rev, part_no, specs, division,
+// min stock/order) is re-synced on each import, so pressing Import again
+// brings the row back in sync with the old system. Part Rev No goes to the
+// part_rev_no column for finished goods, or into `notes` for other items
+// (see bom_import_part_rev_placement). Edges keyed on (parent_id, child_id) with no
 // ref_designator. With upsert ON, an existing edge has its qty/sort
 // updated. With upsert OFF, it's skipped.
 //
@@ -305,6 +309,7 @@ function bom_import_hierarchical_parse(array $parsedRows) {
             'dwg_no'           => trim((string)($row['dwg_no'] ?? '')),
             'dwg_rev_no'       => trim((string)($row['rev_no'] ?? '')),
             'part_no'          => trim((string)($row['part_no'] ?? '')),
+            'part_rev_no'      => trim((string)($row['part_rev_no'] ?? '')),
             'process_spec'     => trim((string)($row['process spec'] ?? '')),
             'material_spec'    => trim((string)($row['material spec'] ?? '')),
             'min_stock_level'  => trim((string)($row['min stock level'] ?? '')),
@@ -484,6 +489,50 @@ function bom_import_check_cross_row_cycles_hier(array $items, array &$edgeResult
 }
 
 // ------------------------------------------------------------
+// Decide where an item's Part Rev No goes.
+//
+// inv_items carries a UNIQUE index on (part_no, part_rev_no) for the
+// product catalog. The legacy BOM models one physical part's process
+// route as several items that all share the same part_no AND part rev
+// (e.g. the finished plate + its "Laser Cut Blank" + "Forming" stages),
+// so writing the real rev onto every one of them would collide.
+//
+// Rule (per business decision): only FINISHED GOODS (category 'finshd')
+// carry part_rev_no in the column — they are the unique catalog rows.
+// For every other item the rev is recorded in `notes` ("Part Rev No: X")
+// for future reference, and the column is left NULL so it never clashes.
+//
+// Returns ['col' => string|null, 'finished' => bool].
+function bom_import_part_rev_placement(array $it) {
+    $partRev  = isset($it['part_rev_no']) ? trim((string)$it['part_rev_no']) : '';
+    $finished = (isset($it['category_code']) ? $it['category_code'] : '') === 'finshd';
+    return [
+        'rev'      => $partRev,
+        'finished' => $finished,
+        'col'      => ($finished && $partRev !== '') ? $partRev : null,
+    ];
+}
+
+// Merge a Part Rev No tag into an existing notes blob, idempotently.
+// Strips any prior auto-written "Part Rev No: …" line first, so a second
+// import never stacks duplicate tags. Passing an empty $partRev just
+// removes the tag (used when an item is/becomes a finished good and the
+// rev lives in the column instead). Returns null when nothing is left.
+function bom_import_notes_set_part_rev($existingNotes, $partRev) {
+    $partRev = trim((string)$partRev);
+    $lines   = preg_split('/\r\n|\r|\n/', (string)$existingNotes);
+    $kept    = [];
+    foreach ($lines as $ln) {
+        if (preg_match('/^\s*Part Rev No\s*:/i', $ln)) continue;
+        $kept[] = $ln;
+    }
+    $base = trim(implode("\n", $kept));
+    if ($partRev === '') return $base !== '' ? $base : null;
+    $tag = 'Part Rev No: ' . $partRev;
+    return $base !== '' ? ($base . "\n" . $tag) : $tag;
+}
+
+// ------------------------------------------------------------
 // Insert ONE new inv_items row from a parsed item. Returns the new id.
 // Shared by the single-shot (bom_import_commit_hierarchical) and the
 // batched (bom_batch_commit_items) commit paths so the column list lives
@@ -495,6 +544,9 @@ function bom_import_insert_one_item($code, array $it, $fks, array &$divCache, ar
     // Resolve (or auto-create) the division for this row. Empty I_Division
     // resolves to a fallback '__unknown' division so the FK stays valid.
     $divId = bom_import_resolve_division($it['division_name'], $divCache, $divCreatedNow);
+    // Part Rev No: column for finished goods, notes for everything else.
+    $pr        = bom_import_part_rev_placement($it);
+    $notesVal  = $pr['finished'] ? null : bom_import_notes_set_part_rev(null, $pr['rev']);
     db_exec(
         "INSERT INTO inv_items
             (code, name, short_description, long_description,
@@ -508,12 +560,12 @@ function bom_import_insert_one_item($code, array $it, $fks, array &$divCache, ar
              is_active, is_product, created_at, updated_at)
          VALUES (?, ?, ?, ?,
                  ?, ?, 'internal',
-                 ?, ?, ?, ?, NULL,
+                 ?, ?, ?, ?, ?,
                  ?, NULL, NULL,
                  NULL, NULL,
                  ?, ?,
                  0, 0,
-                 ?, NULL, NULL,
+                 ?, NULL, ?,
                  1, ?, NOW(), NOW())",
         [
             $code,
@@ -526,13 +578,70 @@ function bom_import_insert_one_item($code, array $it, $fks, array &$divCache, ar
             $it['dwg_no']     !== '' ? $it['dwg_no']     : null,
             $it['dwg_rev_no'] !== '' ? $it['dwg_rev_no'] : null,
             $it['part_no']    !== '' ? $it['part_no']    : null,
+            $pr['col'],
             $it['process_spec'] !== '' ? $it['process_spec'] : null,
             $minStock, $minOrder,
             $it['material_spec'] !== '' ? $it['material_spec'] : null,
+            $notesVal,
             $it['is_root'] ? 1 : 0,
         ]
     );
     return (int)db_val('SELECT LAST_INSERT_ID()');
+}
+
+// ------------------------------------------------------------
+// Update an EXISTING inv_items row from a parsed item (re-import).
+// Refreshes every import-sourced column so a second import press
+// brings the row back in sync with the old system. is_product /
+// is_active / stock are deliberately left untouched (managed in
+// MagDyn, not by the importer).
+// ------------------------------------------------------------
+function bom_import_update_one_item($id, array $it, $fks, array &$divCache, array &$divCreatedNow) {
+    $minStock = is_numeric($it['min_stock_level']) ? (float)$it['min_stock_level'] : null;
+    $minOrder = is_numeric($it['min_order_qty'])  ? (float)$it['min_order_qty']  : null;
+    $divId = bom_import_resolve_division($it['division_name'], $divCache, $divCreatedNow);
+    // Part Rev No: column for finished goods, notes for everything else.
+    // For finished goods we also strip any prior "Part Rev No:" note tag so
+    // the rev isn't recorded in two places; for others we re-tag the notes
+    // (preserving any manual notes the row already carries).
+    $pr        = bom_import_part_rev_placement($it);
+    $curNotes  = db_val('SELECT notes FROM inv_items WHERE id = ?', [(int)$id], null);
+    $notesVal  = bom_import_notes_set_part_rev($curNotes, $pr['finished'] ? '' : $pr['rev']);
+    db_exec(
+        "UPDATE inv_items SET
+             name             = ?,
+             short_description = ?,
+             long_description = ?,
+             category_id      = ?,
+             division_id      = ?,
+             dwg_no           = ?,
+             dwg_rev_no       = ?,
+             part_no          = ?,
+             part_rev_no      = ?,
+             process_spec     = ?,
+             min_stock_level  = ?,
+             min_order_qty    = ?,
+             material_spec    = ?,
+             notes            = ?,
+             updated_at       = NOW()
+         WHERE id = ?",
+        [
+            $it['name'],
+            $it['name'],
+            $it['long_description'] !== '' ? $it['long_description'] : null,
+            $fks['cat_id_by_code'][$it['category_code']],
+            $divId,
+            $it['dwg_no']     !== '' ? $it['dwg_no']     : null,
+            $it['dwg_rev_no'] !== '' ? $it['dwg_rev_no'] : null,
+            $it['part_no']    !== '' ? $it['part_no']    : null,
+            $pr['col'],
+            $it['process_spec'] !== '' ? $it['process_spec'] : null,
+            $minStock, $minOrder,
+            $it['material_spec'] !== '' ? $it['material_spec'] : null,
+            $notesVal,
+            (int)$id,
+        ]
+    );
 }
 
 // ------------------------------------------------------------
@@ -547,9 +656,15 @@ function bom_import_commit_hierarchical(array $items, array $edgeResult, $fks, a
         // 1) Items
         foreach ($items as $code => $it) {
             if ($it['action'] === 'reuse') {
-                $codeToId[$code] = $it['existing_id'];
-                $stats['items_reused']++;
-                continue;
+                $eid = (int)$it['existing_id'];
+                if ($eid <= 0) $eid = (int)db_val('SELECT id FROM inv_items WHERE code = ?', [$code], 0);
+                if ($eid > 0) {
+                    bom_import_update_one_item($eid, $it, $fks, $divCache, $divCreatedNow);
+                    $codeToId[$code] = $eid;
+                    $stats['items_updated']++;
+                    continue;
+                }
+                // Row vanished since parse — fall through and recreate it.
             }
             $codeToId[$code] = bom_import_insert_one_item($code, $it, $fks, $divCache, $divCreatedNow);
             $stats['items_created']++;
@@ -609,14 +724,14 @@ function bom_import_render_preview_hier($title, $token, $upsert, array $items, a
             <h1><?= h($title) ?></h1>
             <p class="muted">
                 Review the items and edges below. Items keyed on code — pre-existing items
-                are reused (never modified). Edges flagged red will be skipped on commit.
+                are updated in place (all fields re-synced from the old system). Edges flagged red will be skipped on commit.
             </p>
         </div>
     </div>
 
     <div class="import-summary" style="margin-bottom: 14px;">
         <span class="pill pill-success">+ Items create: <?= count($itemsCreate) ?></span>
-        <span class="pill pill-neutral">⊙ Items reuse: <?= count($itemsReuse) ?></span>
+        <span class="pill pill-info">⟳ Items update: <?= count($itemsReuse) ?></span>
         <span class="pill pill-success">✓ Edges insert: <?= (int)$edgeResult['counts']['insert'] ?></span>
         <span class="pill pill-info">⟳ Edges update: <?= (int)$edgeResult['counts']['update'] ?></span>
         <span class="pill pill-neutral">⊘ Edges skip: <?= (int)$edgeResult['counts']['skip'] ?></span>
@@ -701,7 +816,7 @@ function bom_import_render_preview_hier($title, $token, $upsert, array $items, a
         function showStats(s) {
             if (!s) return;
             liveEl.textContent =
-                'items: ' + s.items_created + ' created / ' + s.items_reused + ' reused · ' +
+                'items: ' + s.items_created + ' created / ' + (s.items_updated || 0) + ' updated / ' + s.items_reused + ' reused · ' +
                 'edges: ' + s.edges_inserted + ' inserted / ' + s.edges_updated + ' updated · ' +
                 'stock: ' + s.stocks_imported + ' set';
         }
@@ -977,7 +1092,7 @@ if ($action === 'bom_import_commit') {
     $edges   = bom_import_resolve_edges($parsedH['items'], $parsedH['edges'], $upsert);
     bom_import_check_cross_row_cycles_hier($parsedH['items'], $edges);
 
-    $stats = ['items_created' => 0, 'items_reused' => 0,
+    $stats = ['items_created' => 0, 'items_reused' => 0, 'items_updated' => 0,
               'edges_inserted' => 0, 'edges_updated' => 0,
               'divisions_created' => 0, 'divisions_created_names' => [],
               'error' => ''];
@@ -1002,8 +1117,8 @@ if ($action === 'bom_import_commit') {
     );
 
     $msg = sprintf(
-        'BOM import complete · items: %d created / %d reused · edges: %d inserted / %d updated',
-        $stats['items_created'], $stats['items_reused'],
+        'BOM import complete · items: %d created / %d updated / %d reused · edges: %d inserted / %d updated',
+        $stats['items_created'], (int)($stats['items_updated'] ?? 0), $stats['items_reused'],
         $stats['edges_inserted'], $stats['edges_updated']
     );
     if (!empty($stats['divisions_created'])) {
@@ -1067,6 +1182,8 @@ function bom_import_parse_json_response(array $jsonData) {
                                     ? $jItem['rev_no'] : '')),
             'part_no'          => trim((string)(isset($jItem['part_no'])
                                     ? $jItem['part_no'] : '')),
+            'part_rev_no'      => trim((string)(isset($jItem['part_rev_no'])
+                                    ? $jItem['part_rev_no'] : '')),
             'process_spec'     => trim((string)(isset($jItem['process_spec'])
                                     ? $jItem['process_spec'] : '')),
             'material_spec'    => trim((string)(isset($jItem['material_spec'])
@@ -1383,10 +1500,26 @@ function bom_batch_commit_items(array $plan, $offset, array &$stats) {
         foreach ($codes as $code) {
             $it = isset($plan['items'][$code]) ? $plan['items'][$code] : null;
             if ($it === null) continue;
-            if ($it['action'] === 'reuse') { $stats['items_reused']++; continue; }
-            // Retry-safe: if a prior (partial) run already created it, reuse.
+            // Existing row → update every import-sourced value (re-import sync).
+            if ($it['action'] === 'reuse') {
+                $eid = (int)$it['existing_id'];
+                if ($eid <= 0) {
+                    $eid = (int)db_val('SELECT id FROM inv_items WHERE code = ?', [$code], 0);
+                }
+                if ($eid > 0) {
+                    bom_import_update_one_item($eid, $it, $fks, $divCache, $divCreatedNow);
+                    $stats['items_updated']++;
+                    continue;
+                }
+                // Row vanished since prepare — fall through and recreate it.
+            }
+            // Retry-safe: if a prior run already created it, update in place.
             $existing = (int)db_val('SELECT id FROM inv_items WHERE code = ?', [$code], 0);
-            if ($existing > 0) { $stats['items_reused']++; continue; }
+            if ($existing > 0) {
+                bom_import_update_one_item($existing, $it, $fks, $divCache, $divCreatedNow);
+                $stats['items_updated']++;
+                continue;
+            }
             $createdIds[] = bom_import_insert_one_item($code, $it, $fks, $divCache, $divCreatedNow);
             $stats['items_created']++;
         }
@@ -1472,8 +1605,8 @@ function bom_batch_commit_stock(array $plan, $offset, array &$stats) {
 // ── build the human-readable completion message from accumulated stats ───────
 function bom_old_import_build_summary(array $stats) {
     $msg = sprintf(
-        'BOM import complete · items: %d created / %d reused · edges: %d inserted / %d updated',
-        (int)$stats['items_created'], (int)$stats['items_reused'],
+        'BOM import complete · items: %d created / %d updated / %d reused · edges: %d inserted / %d updated',
+        (int)$stats['items_created'], (int)($stats['items_updated'] ?? 0), (int)$stats['items_reused'],
         (int)$stats['edges_inserted'], (int)$stats['edges_updated']
     );
     if (!empty($stats['divisions_created'])) {
@@ -1505,6 +1638,7 @@ function bom_old_import_build_summary(array $stats) {
 function bom_old_import_stats_brief(array $stats) {
     return [
         'items_created'   => (int)$stats['items_created'],
+        'items_updated'   => (int)($stats['items_updated'] ?? 0),
         'items_reused'    => (int)$stats['items_reused'],
         'edges_inserted'  => (int)$stats['edges_inserted'],
         'edges_updated'   => (int)$stats['edges_updated'],
@@ -1746,7 +1880,7 @@ if ($action === 'bom_old_import_commit') {
     $edges   = bom_import_resolve_edges($parsedH['items'], $parsedH['edges'], $upsert);
     bom_import_check_cross_row_cycles_hier($parsedH['items'], $edges);
 
-    $stats = ['items_created' => 0, 'items_reused' => 0,
+    $stats = ['items_created' => 0, 'items_reused' => 0, 'items_updated' => 0,
               'edges_inserted' => 0, 'edges_updated' => 0,
               'divisions_created' => 0, 'divisions_created_names' => [],
               'stocks_imported' => 0, 'stocks_zero_skip' => 0,
@@ -1838,7 +1972,7 @@ if ($action === 'bom_old_import_commit_batch') {
             bom_import_check_cross_row_cycles_hier($parsedH['items'], $edges);
 
             $stats = [
-                'items_created'  => 0, 'items_reused'   => 0,
+                'items_created'  => 0, 'items_reused'   => 0, 'items_updated' => 0,
                 'edges_inserted' => 0, 'edges_updated'  => 0, 'edge_errors' => [],
                 'divisions_created' => 0, 'divisions_created_names' => [],
             ];
@@ -2411,4 +2545,325 @@ if ($action === 'bom_delete_commit') {
         flash_set('error', 'Delete failed: ' . $e->getMessage());
         redirect(url('/inventory.php?action=bom_view&id=' . $id));
     }
+}
+
+// ============================================================
+// RECEIPT VERIFY — mark shipments 'received' from the old
+// "Ship and Receipt Report" CSV
+// ============================================================
+//
+// FORMAT (one row per legacy transaction):
+//   TransID,ShipDt/DueDt (CrtDt),Status,Company/Vendor,Product,PoNo,Qty,Loc,Options
+//
+// A Status that CONTAINS "RX" means that transaction was RECEIVED on the
+// old server. Each legacy receipt transaction maps to exactly one
+// inv_shipment_lines row (line_kind='receive') via old_transaction_id.
+// For each matched receive line we:
+//   1. set the line's qty_received = qty_planned (so the view reads
+//      "full" instead of "N open"), and
+//   2. flip the parent shipment's status to 'received'.
+//
+// SCOPE: inv_shipments.status and inv_shipment_lines.qty_received are
+// touched. STOCK (inv_item_location_stock) is NOT — this is a status /
+// quantity reconciliation against the old system, not a live receiving
+// operation. No inv_receipts rows are created and no inventory txns are
+// posted, so on-hand stock is unchanged.
+//
+// Shipments already 'received' still get their matched lines' qty filled
+// (fixing the "received but open" inconsistency), but terminal shipments
+// ('closed'/'cancelled') are left entirely alone. Re-running is
+// idempotent — a line already at qty_received = qty_planned is a no-op.
+// Rows whose Status has no "RX" are skipped.
+
+// ------------------------------------------------------------
+// Parse the report rows and resolve each RX transaction to its shipment.
+// Returns the per-transaction detail + summary counts + the deduped set
+// of shipment ids that will flip to 'received' + the receive line ids
+// whose qty_received should be filled to qty_planned.
+// ------------------------------------------------------------
+function receipt_verify_resolve(array $parsedRows) {
+    $rx       = [];   // txn => first CSV line it appeared on
+    $rxStatus = [];   // txn => CSV status string (first occurrence)
+    $noRx     = 0;    // rows present but Status lacks "RX"
+    $noId     = 0;    // rows with no/invalid TransID
+    foreach ($parsedRows as $row) {
+        $txn    = (int)($row['transid'] ?? 0);
+        $status = (string)($row['status'] ?? '');
+        if ($txn <= 0) { $noId++; continue; }
+        if (stripos($status, 'RX') === false) { $noRx++; continue; }
+        if (!isset($rx[$txn])) {
+            $rx[$txn]       = (int)($row['_line'] ?? 0);
+            $rxStatus[$txn] = $status;
+        }
+    }
+
+    // Batch-resolve transactions → receive line → shipment in IN-chunks.
+    $found = [];   // txn => line+shipment row
+    $ids   = array_keys($rx);
+    foreach (array_chunk($ids, 1000) as $chunk) {
+        $ph  = implode(',', array_fill(0, count($chunk), '?'));
+        $res = db_all(
+            "SELECT l.old_transaction_id AS txn, l.id AS line_id,
+                    l.qty_planned, l.qty_received,
+                    l.shipment_id, s.status, s.ship_no
+               FROM inv_shipment_lines l
+               JOIN inv_shipments s ON s.id = l.shipment_id
+              WHERE l.line_kind = 'receive'
+                AND l.old_transaction_id IN ($ph)",
+            $chunk
+        );
+        foreach ($res as $r) {
+            $found[(int)$r['txn']] = $r;   // txn is unique to one receive line
+        }
+    }
+
+    $detail            = [];
+    $shipmentsToUpdate = [];   // shipment_id => ship_no (deduped) — status flip
+    $linesToFill       = [];   // line_id => qty_planned — qty_received backfill
+    $counts = ['update' => 0, 'already' => 0, 'terminal' => 0, 'unmatched' => 0];
+    foreach ($rx as $txn => $line) {
+        if (!isset($found[$txn])) {
+            $counts['unmatched']++;
+            $detail[] = ['txn' => $txn, 'line' => $line, 'csv_status' => $rxStatus[$txn],
+                         'ship_no' => null, 'cur' => null, 'action' => 'unmatched', 'fill' => false];
+            continue;
+        }
+        $f        = $found[$txn];
+        $cur      = (string)$f['status'];
+        $sid      = (int)$f['shipment_id'];
+        $lineId   = (int)$f['line_id'];
+        $planned  = (float)$f['qty_planned'];
+        $received = (float)$f['qty_received'];
+        $terminal = ($cur === 'closed' || $cur === 'cancelled');
+
+        // Fill qty on any non-terminal matched line that isn't already full.
+        // (Even already-'received' shipments get their open lines filled, so
+        // the "received but open" inconsistency is corrected.)
+        $willFill = (!$terminal && $received + 0.0001 < $planned);
+        if ($willFill) $linesToFill[$lineId] = $planned;
+
+        if ($cur === 'received') {
+            $counts['already']++; $act = 'already';
+        } elseif ($terminal) {
+            $counts['terminal']++; $act = 'terminal';
+        } else {
+            $counts['update']++; $act = 'update';
+            $shipmentsToUpdate[$sid] = (string)$f['ship_no'];
+        }
+        $detail[] = ['txn' => $txn, 'line' => $line, 'csv_status' => $rxStatus[$txn],
+                     'ship_no' => (string)$f['ship_no'], 'cur' => $cur,
+                     'action' => $act, 'shipment_id' => $sid, 'fill' => $willFill];
+    }
+
+    return [
+        'detail'              => $detail,
+        'counts'              => $counts,
+        'shipments_to_update' => $shipmentsToUpdate,
+        'lines_to_fill'       => $linesToFill,
+        'no_rx'               => $noRx,
+        'no_id'               => $noId,
+        'rx_total'            => count($rx),
+    ];
+}
+
+if ($action === 'receipt_verify_preview') {
+    // Marking shipments received is a shipment/receipt operation —
+    // gate it on that module, not on BOM permissions.
+    require_permission('inventory_shiprcpt', 'manage');
+    csrf_check();
+
+    $parsed = import_parse_uploaded_csv('csv');
+    if (empty($parsed['ok'])) {
+        flash_set('error', $parsed['error']);
+        redirect(url('/inventory.php?action=bom_grid'));
+    }
+    $hdr = $parsed['header'] ?? [];
+    if (!in_array('transid', $hdr, true) || !in_array('status', $hdr, true)) {
+        flash_set('error', 'CSV is missing the required TransID / Status columns '
+                         . '(expected the "Ship and Receipt Report" format).');
+        redirect(url('/inventory.php?action=bom_grid'));
+    }
+
+    $token = import_stash($parsed['csv_text'], 'receipt_verify');
+    $r     = receipt_verify_resolve($parsed['rows']);
+
+    $distinctShipments = count($r['shipments_to_update']);
+    $linesToFill       = count($r['lines_to_fill']);
+
+    $page_title  = 'Verify received · preview';
+    $page_module = 'inventory_shiprcpt';
+    require dirname(__DIR__, 2) . '/includes/header.php';
+
+    $commitUrl = url('/inventory.php?action=receipt_verify_commit');
+    $cancelUrl = url('/inventory.php?action=bom_grid');
+    ?>
+    <div class="page-head">
+        <div>
+            <h1>Verify received · preview</h1>
+            <p class="muted">
+                For every legacy receipt transaction whose <code>Status</code> contains
+                <code>RX</code>, the matched receive line's <strong>received qty is set to its
+                planned qty</strong> (so it reads "full") and the parent shipment is marked
+                <strong>received</strong>. <strong>Stock is not changed</strong> — no inventory
+                txns are posted. Terminal shipments (closed / cancelled) are left alone.
+            </p>
+        </div>
+    </div>
+
+    <div class="import-summary" style="margin-bottom:14px;">
+        <span class="pill pill-success">✓ Shipments to mark received: <?= (int)$distinctShipments ?></span>
+        <span class="pill pill-success">▦ Receive lines to fill (qty): <?= (int)$linesToFill ?></span>
+        <span class="pill pill-info">⟳ Transactions matched: <?= (int)$r['counts']['update'] ?></span>
+        <span class="pill pill-neutral">✓ Already received: <?= (int)$r['counts']['already'] ?></span>
+        <span class="pill pill-neutral">⊘ Closed/cancelled (left alone): <?= (int)$r['counts']['terminal'] ?></span>
+        <span class="pill pill-danger">✗ Unmatched transactions: <?= (int)$r['counts']['unmatched'] ?></span>
+    </div>
+    <p class="muted small" style="margin-top:-6px;margin-bottom:14px;">
+        RX rows in file: <?= (int)$r['rx_total'] ?>
+        · rows without RX (skipped): <?= (int)$r['no_rx'] ?>
+        <?php if ($r['no_id'] > 0): ?> · rows without a TransID: <?= (int)$r['no_id'] ?><?php endif; ?>
+    </p>
+
+    <?php $nothingToDo = ($distinctShipments === 0 && $linesToFill === 0); ?>
+    <div class="import-actions" style="margin-bottom:18px;">
+        <form method="post" action="<?= h($commitUrl) ?>" style="display:inline"
+              onsubmit="return confirm('Mark <?= (int)$distinctShipments ?> shipment(s) received and fill <?= (int)$linesToFill ?> receive line(s) to planned qty? Stock is not changed.');">
+            <?= csrf_field() ?>
+            <input type="hidden" name="token" value="<?= h($token) ?>">
+            <button type="submit" class="btn btn-primary" <?= $nothingToDo ? 'disabled' : '' ?>>
+                Mark <?= (int)$distinctShipments ?> shipment<?= $distinctShipments === 1 ? '' : 's' ?> received
+            </button>
+        </form>
+        <a class="btn btn-ghost" href="<?= h($cancelUrl) ?>">Cancel</a>
+    </div>
+
+    <?php
+    // Cap the detail table — these reports run to thousands of rows and we
+    // don't need to paint every one to let the user sanity-check the result.
+    $cap     = 1000;
+    $shown   = array_slice($r['detail'], 0, $cap);
+    $hidden  = count($r['detail']) - count($shown);
+    ?>
+    <div class="card" style="margin-bottom:18px;">
+        <div class="card-head"><h3 style="margin:0;font-size:15px;">Transactions (<?= count($r['detail']) ?>)</h3></div>
+        <div class="card-body" style="padding:0">
+            <table class="data-table">
+                <thead><tr>
+                    <th>Action</th><th>TransID</th><th>CSV status</th>
+                    <th>Shipment</th><th>Current status</th><th>Fill qty</th><th>CSV line</th>
+                </tr></thead>
+                <tbody>
+                    <?php foreach ($shown as $d):
+                        $pill = 'pill-neutral'; $label = strtoupper($d['action']);
+                        if      ($d['action'] === 'update')    { $pill = 'pill-success'; $label = 'RECEIVE'; }
+                        elseif  ($d['action'] === 'already')   { $pill = 'pill-info';    $label = 'ALREADY'; }
+                        elseif  ($d['action'] === 'terminal')  { $pill = 'pill-neutral'; $label = 'SKIP'; }
+                        elseif  ($d['action'] === 'unmatched') { $pill = 'pill-danger';  $label = 'NO MATCH'; }
+                    ?>
+                        <tr>
+                            <td><span class="pill <?= $pill ?>"><?= h($label) ?></span></td>
+                            <td><code><?= (int)$d['txn'] ?></code></td>
+                            <td class="muted small"><?= h($d['csv_status']) ?></td>
+                            <td><?= $d['ship_no'] !== null ? '<code>' . h($d['ship_no']) . '</code>' : '<span class="muted">—</span>' ?></td>
+                            <td class="muted small"><?= $d['cur'] !== null ? h($d['cur']) : '—' ?></td>
+                            <td class="muted small"><?= !empty($d['fill']) ? '✓' : '—' ?></td>
+                            <td class="muted small"><?= (int)$d['line'] ?></td>
+                        </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+            <?php if ($hidden > 0): ?>
+                <div class="muted small" style="padding:10px 14px;">
+                    … and <?= (int)$hidden ?> more transaction<?= $hidden === 1 ? '' : 's' ?> not shown.
+                    The counts above cover every row; the commit applies to all of them.
+                </div>
+            <?php endif; ?>
+        </div>
+    </div>
+    <?php
+    require dirname(__DIR__, 2) . '/includes/footer.php';
+    exit;
+}
+
+if ($action === 'receipt_verify_commit') {
+    require_permission('inventory_shiprcpt', 'manage');
+    csrf_check();
+
+    $token = (string)input('token', '');
+    $csv   = import_unstash($token, 'receipt_verify');
+    if ($csv === null) {
+        flash_set('error', 'Verify session expired. Please re-upload the CSV.');
+        redirect(url('/inventory.php?action=bom_grid'));
+    }
+    $parsed = import_parse_csv_text($csv);
+    if (empty($parsed['ok'])) {
+        flash_set('error', 'Re-parse failed: ' . ($parsed['error'] ?? 'unknown'));
+        redirect(url('/inventory.php?action=bom_grid'));
+    }
+
+    $r        = receipt_verify_resolve($parsed['rows']);
+    $shipIds  = array_keys($r['shipments_to_update']);
+    $lineIds  = array_keys($r['lines_to_fill']);
+
+    $updated     = 0;   // shipments flipped to received
+    $linesFilled = 0;   // receive lines whose qty_received was filled
+    if (!empty($shipIds) || !empty($lineIds)) {
+        db_exec('START TRANSACTION');
+        try {
+            // 1) Fill qty_received = qty_planned on matched receive lines.
+            //    The kind + remaining guards keep this idempotent and make a
+            //    ship line or already-full line impossible to touch. Stock is
+            //    untouched: this is a raw column update, not a posted receipt.
+            foreach (array_chunk($lineIds, 500) as $chunk) {
+                $ph = implode(',', array_fill(0, count($chunk), '?'));
+                $linesFilled += db_exec(
+                    "UPDATE inv_shipment_lines
+                        SET qty_received = qty_planned
+                      WHERE id IN ($ph)
+                        AND line_kind = 'receive'
+                        AND qty_received < qty_planned",
+                    $chunk
+                );
+            }
+            // 2) Flip shipment status to received. The status guard repeats
+            //    the resolve-time filter so a shipment that became terminal
+            //    between preview and commit is never dragged back.
+            foreach (array_chunk($shipIds, 500) as $chunk) {
+                $ph = implode(',', array_fill(0, count($chunk), '?'));
+                $updated += db_exec(
+                    "UPDATE inv_shipments
+                        SET status = 'received'
+                      WHERE id IN ($ph)
+                        AND status NOT IN ('received', 'closed', 'cancelled')",
+                    $chunk
+                );
+            }
+            db_exec('COMMIT');
+        } catch (Exception $e) {
+            db_exec('ROLLBACK');
+            flash_set('error', 'Verify failed: ' . $e->getMessage());
+            redirect(url('/inventory.php?action=bom_grid'));
+        }
+    }
+
+    db_exec(
+        "INSERT INTO audit_log (actor_id, action, target_id, details)
+         VALUES (?, 'inventory.shipment.receipt_verify', 0, ?)",
+        [current_user_id(), json_encode([
+            'shipments_marked_received' => $updated,
+            'lines_qty_filled'          => $linesFilled,
+            'rx_total'                  => $r['rx_total'],
+            'already_received'          => $r['counts']['already'],
+            'unmatched'                 => $r['counts']['unmatched'],
+        ])]
+    );
+
+    flash_set('success', sprintf(
+        'Receipt verify complete · %d shipment%s marked received · %d receive line%s filled to planned qty · %d already received · %d unmatched transaction%s.',
+        $updated, $updated === 1 ? '' : 's',
+        $linesFilled, $linesFilled === 1 ? '' : 's',
+        (int)$r['counts']['already'],
+        (int)$r['counts']['unmatched'], $r['counts']['unmatched'] === 1 ? '' : 's'
+    ));
+    redirect(url('/inventory.php?action=bom_grid'));
 }

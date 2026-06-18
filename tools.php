@@ -139,7 +139,15 @@ if ($view !== '') {
 // the MagDyn sidebar already provides navigation. Standalone mode (the
 // "Open standalone" link, opened in a new tab) gets the tool's full
 // native UI with its own sidebar intact.
-$iframeSrc .= ($view !== '' ? '&' : '?') . 'embed=1';
+//
+// Exception: the Weight and Engineering calculators are no longer nested
+// in the sidebar (their sub-tools were removed from the nav), so they
+// must keep their OWN internal menu visible to stay navigable. Render
+// them non-embedded.
+$KEEP_OWN_NAV = ['weight', 'calc'];
+if (!in_array($tool, $KEEP_OWN_NAV, true)) {
+    $iframeSrc .= ($view !== '' ? '&' : '?') . 'embed=1';
+}
 
 require __DIR__ . '/includes/header.php';
 ?>

@@ -41,6 +41,35 @@ if (!function_exists('qc_loc_id')) {
     }
 }
 
+if (!function_exists('qc_item_template_id')) {
+    /**
+     * Return the id of the active inspection template linked to an
+     * inv_item, or 0 if the item has none. This is the single source of
+     * truth for the "does this item need QC?" decision used by the
+     * Ship&Receipt receive flow and the Process Inventory flow: an item
+     * with a template goes to LOC-QCH and gets an auto-inspection; an
+     * item without one is added straight to stores (ST-HLD) with no
+     * inspection. Caches per-request since a receipt page may ask about
+     * the same item several times.
+     */
+    function qc_item_template_id($itemId)
+    {
+        static $cache = [];
+        $itemId = (int)$itemId;
+        if ($itemId <= 0) return 0;
+        if (array_key_exists($itemId, $cache)) return $cache[$itemId];
+        $row = db_one(
+            "SELECT t.id FROM inspection_template_targets tt
+               JOIN inspection_templates t ON t.id = tt.template_id AND t.is_active = 1
+              WHERE tt.entity_type = 'inv_item' AND tt.entity_id = ?
+              ORDER BY t.id LIMIT 1",
+            [$itemId]
+        );
+        $cache[$itemId] = $row ? (int)$row['id'] : 0;
+        return $cache[$itemId];
+    }
+}
+
 if (!function_exists('qc_next_inspection_code')) {
     /**
      * Generate the next inspection code in the INSP-NNNNNN format used
@@ -138,19 +167,8 @@ if (!function_exists('qc_auto_create_inspection_for_txn')) {
 
         // Look up the item's linked template so the checklist is ready
         // for the inspector without manual template selection.
-        $linkedTplId = null;
-        if ($txn['item_id']) {
-            $tplRow = db_one(
-                "SELECT t.id FROM inspection_template_targets tt
-                   JOIN inspection_templates t ON t.id = tt.template_id AND t.is_active = 1
-                  WHERE tt.entity_type = 'inv_item' AND tt.entity_id = ?
-                  ORDER BY t.id LIMIT 1",
-                [(int)$txn['item_id']]
-            );
-            if ($tplRow) {
-                $linkedTplId = (int)$tplRow['id'];
-            }
-        }
+        $linkedTplId = $txn['item_id'] ? qc_item_template_id((int)$txn['item_id']) : 0;
+        if (!$linkedTplId) $linkedTplId = null;
 
         db_exec(
             'INSERT INTO inspections

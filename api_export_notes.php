@@ -26,11 +26,25 @@
  *           attachments: [ {attachment_id, filename, type, tmp_name}, ... ]
  *       }, ... ], "count": N}
  *
+ *   ?action=attachments_count
+ *       Returns: {"count": 2960}   (non-redacted attachments with a tmp_name)
+ *
+ *   ?action=attachment_file&tmp=<tmp_name>   (or &id=<attachment_id>)
+ *       Streams the physical attachment file (binary), located on disk by its
+ *       ORIGINAL filename under uploads/. On error returns JSON
+ *       {"error": "..."} with a 4xx/5xx status, so the caller can tell a
+ *       genuine "missing on disk" (404) apart from the success (200) case.
+ *
  * PHP 5.6 compatible — no null coalescing, no return types, no scalar hints.
  */
 
 // ── Shared secret ────────────────────────────────────────────────────────────
 define('API_TOKEN', 'MAGDYN_IMPORT_SECRET');   // ← must match config/old_inventory_api.php
+
+// Directory the physical attachment files live in on the old server. The old
+// uploader (uploads/ajax.php) saved each file under its ORIGINAL basename in
+// this folder — NOT under the SHA-256 tmp_name recorded in the DB.
+define('UPLOAD_DIR', __DIR__ . '/uploads');
 
 // ── Auth check ───────────────────────────────────────────────────────────────
 header('Content-Type: application/json; charset=utf-8');
@@ -84,6 +98,95 @@ if ($action === 'notes_count') {
     } catch (Exception $e) {
         echo json_encode(array('error' => 'Count query failed: ' . $e->getMessage()));
     }
+    exit;
+}
+
+// ── attachments_count — non-redacted attachments that have a tmp_name ──────────
+if ($action === 'attachments_count') {
+    try {
+        $n = (int)$pdo->query(
+            "SELECT COUNT(*) FROM notes_attachments
+              WHERE redact = 0 AND tmp_name IS NOT NULL AND tmp_name != ''"
+        )->fetchColumn();
+        echo json_encode(array('count' => $n));
+    } catch (Exception $e) {
+        echo json_encode(array('error' => 'Count query failed: ' . $e->getMessage()));
+    }
+    exit;
+}
+
+// ── attachment_file — stream one physical attachment (binary) ──────────────────
+if ($action === 'attachment_file') {
+    $tmp = isset($_GET['tmp']) ? trim($_GET['tmp']) : '';
+    $aid = isset($_GET['id'])  ? (int)$_GET['id']    : 0;
+
+    if ($tmp === '' && $aid <= 0) {
+        http_response_code(400);
+        echo json_encode(array('error' => 'Missing tmp or id parameter'));
+        exit;
+    }
+
+    // Look up the original filename for this attachment.
+    try {
+        if ($aid > 0) {
+            $st = $pdo->prepare('SELECT filename, type FROM notes_attachments WHERE attachment_id = ? AND redact = 0 LIMIT 1');
+            $st->execute(array($aid));
+        } else {
+            $st = $pdo->prepare('SELECT filename, type FROM notes_attachments WHERE tmp_name = ? AND redact = 0 LIMIT 1');
+            $st->execute(array($tmp));
+        }
+        $row = $st->fetch();
+    } catch (Exception $e) {
+        http_response_code(500);
+        echo json_encode(array('error' => 'Query failed: ' . $e->getMessage()));
+        exit;
+    }
+
+    if (!$row) {
+        http_response_code(404);
+        echo json_encode(array('error' => 'Attachment row not found (redacted or unknown).'));
+        exit;
+    }
+
+    // Resolve the physical file. Try the original basename and a couple of
+    // decoded variants (the legacy uploader ran htmlspecialchars on names),
+    // under uploads/ and uploads/attachments/.
+    $raw  = trim((string)$row['filename']);
+    $cands = array();
+    $cands[basename($raw)] = true;
+    $cands[basename(html_entity_decode($raw, ENT_QUOTES))] = true;
+
+    $path = null;
+    foreach (array_keys($cands) as $base) {
+        if ($base === '') { continue; }
+        foreach (array(UPLOAD_DIR . '/' . $base, UPLOAD_DIR . '/attachments/' . $base) as $c) {
+            if (is_file($c)) { $path = $c; break 2; }
+        }
+    }
+
+    if ($path === null) {
+        http_response_code(404);
+        echo json_encode(array('error' => 'File missing on disk: ' . basename($raw)));
+        exit;
+    }
+
+    // Path-traversal guard: the resolved file must live inside UPLOAD_DIR.
+    $realBase = realpath(UPLOAD_DIR);
+    $realFile = realpath($path);
+    if ($realFile === false || $realBase === false || strpos($realFile, $realBase) !== 0) {
+        http_response_code(403);
+        echo json_encode(array('error' => 'Resolved path is outside the uploads directory.'));
+        exit;
+    }
+
+    // Stream it. Replace the JSON content-type header set at the top.
+    $mime = ($row['type'] !== '' && $row['type'] !== null) ? $row['type'] : 'application/octet-stream';
+    header('Content-Type: ' . $mime);
+    header('Content-Length: ' . filesize($realFile));
+    header('Content-Disposition: attachment; filename="' . basename($realFile) . '"');
+    // Clear any buffered output (the header() calls above are fine; nothing was echoed).
+    while (ob_get_level() > 0) { ob_end_clean(); }
+    readfile($realFile);
     exit;
 }
 

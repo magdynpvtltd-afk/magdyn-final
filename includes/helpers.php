@@ -702,3 +702,93 @@ function magdyn_setting($key, $default = '')
     }
     return $cache[$key] ?? $default;
 }
+
+
+/**
+ * Codes of the "held" inventory locations whose stock is tracked but is
+ * NOT available for consumption. Qty parked here (imported from the old
+ * system's "Lost In Process" / "Sample" buckets) may only be added to or
+ * moved between locations — it must never count toward Available, nor be
+ * selectable as a source for a Process (build) or a Shipment line.
+ *
+ *   LOC-LIP  → old "Lost In Process"
+ *   LOC-SMP  → old "Sample"
+ *
+ * Returned as plain codes so callers can build SQL IN() lists or compare
+ * against a location row's code. Matching everywhere is case-insensitive
+ * (utf8mb4_unicode_ci), mirroring how LOC-REJ / I-Rework are matched.
+ */
+if (!function_exists('inv_held_location_codes')) {
+    function inv_held_location_codes()
+    {
+        return ['LOC-LIP', 'LOC-SMP'];
+    }
+}
+
+/**
+ * SQL fragment "'LOC-LIP','LOC-SMP'" for use inside an IN(...) clause.
+ * Codes are constants from inv_held_location_codes(), never user input,
+ * but we still addslashes() defensively to match the surrounding style.
+ */
+if (!function_exists('inv_held_location_codes_sql')) {
+    function inv_held_location_codes_sql()
+    {
+        return "'" . implode("','", array_map(function ($c) {
+            return addslashes($c);
+        }, inv_held_location_codes())) . "'";
+    }
+}
+
+/**
+ * Validate that a password is "hard" enough to be accepted.
+ *
+ * Policy:
+ *   - at least 10 characters
+ *   - at least one lowercase letter
+ *   - at least one uppercase letter
+ *   - at least one digit
+ *   - at least one symbol (non-alphanumeric)
+ *   - must not contain the username or the email local-part (case-insensitive)
+ *
+ * Returns an array of human-readable error strings; an empty array means the
+ * password passes. `$context` may carry 'username' and 'email' to reject
+ * passwords that embed the account identity.
+ */
+if (!function_exists('password_strength_errors')) {
+    function password_strength_errors($password, array $context = [])
+    {
+        $password = (string)$password;
+        $errors   = [];
+
+        if (strlen($password) < 10) {
+            $errors[] = 'Password must be at least 10 characters long.';
+        }
+        if (!preg_match('/[a-z]/', $password)) {
+            $errors[] = 'Password must contain a lowercase letter.';
+        }
+        if (!preg_match('/[A-Z]/', $password)) {
+            $errors[] = 'Password must contain an uppercase letter.';
+        }
+        if (!preg_match('/[0-9]/', $password)) {
+            $errors[] = 'Password must contain a number.';
+        }
+        if (!preg_match('/[^A-Za-z0-9]/', $password)) {
+            $errors[] = 'Password must contain a symbol (e.g. ! @ # $ %).';
+        }
+
+        $needles = [];
+        if (!empty($context['username'])) $needles[] = (string)$context['username'];
+        if (!empty($context['email'])) {
+            $local = explode('@', (string)$context['email'])[0];
+            if ($local !== '') $needles[] = $local;
+        }
+        foreach ($needles as $needle) {
+            if ($needle !== '' && stripos($password, $needle) !== false) {
+                $errors[] = 'Password must not contain your username or email.';
+                break;
+            }
+        }
+
+        return $errors;
+    }
+}

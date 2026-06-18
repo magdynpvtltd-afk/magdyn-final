@@ -2956,8 +2956,11 @@ if ($action === 'list') {
                       . ' title="Import assets from CSV">⤒ Import CSV</button> ';
         $actionsHtml .= '<a class="btn btn-primary btn-sm" href="' . h(url('/asset.php?action=new')) . '"'
                       . ' data-shortcut="N" accesskey="n">' . shortcut_label('+ New asset', 'N') . '</a>';
-        $actionsHtml .= ' <a class="btn btn-ghost btn-sm" href="' . h(url('/old_inventory_import.php')) . '"'
-                      . ' title="Import assets from old inventory_live database">⤒ Import Old Inventory</a>';
+        // Old-inventory import is admin-only and lives under Admin ▸ Old Inventory Import.
+        if (is_admin()) {
+            $actionsHtml .= ' <a class="btn btn-ghost btn-sm" href="' . h(url('/old_inventory_import.php')) . '"'
+                          . ' title="Import assets from old inventory_live database">⤒ Import Old Inventory</a>';
+        }
     }
     if ($canTransact) {
         // Append after the create-side buttons so the order reads

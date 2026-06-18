@@ -77,6 +77,22 @@ function require_permission($module, $action)
     }
 }
 
+/**
+ * True when the current (possibly impersonated) user holds the 'admin' role.
+ *
+ * Used to gate UI that should be admin-only regardless of any functional
+ * permission a non-admin role might also hold — e.g. the "Import from Old
+ * Inventory" buttons, which are now reachable only through the Admin ▸
+ * Old Inventory Import hub.
+ */
+function is_admin()
+{
+    foreach (current_user_roles() as $r) {
+        if (($r['code'] ?? '') === 'admin') return true;
+    }
+    return false;
+}
+
 /** Returns role rows for current user. */
 function current_user_roles()
 {
@@ -112,6 +128,32 @@ function visible_modules()
         if ($dot !== false) $moduleCodes[substr($p, 0, $dot)] = true;
     }
     if (!$moduleCodes) return $cache = [];
+
+    // ---- Nav-visibility inheritance ----
+    // Some sidebar sub-links are thin nav wrappers around a page whose
+    // access is gated by a PARENT group's functional permission, not by
+    // the sub-link's own permission. The Assets group is the case: the
+    // 'asset' group module holds the real permissions (view/manage/...)
+    // and /asset.php checks 'asset.view', while 'asset_view_assets' /
+    // 'asset_view_models' exist only to render the menu links.
+    //
+    // Without this, an admin has to grant BOTH 'asset.view' AND the
+    // per-link permission for the Assets tab to appear — an easy-to-miss
+    // trap (the tab stays hidden even though the user can open the page).
+    // Here a sub-link inherits visibility from its parent permission, so
+    // granting 'asset.view' alone both reveals and opens the tab.
+    $navInherit = [
+        'asset.view'              => ['asset_view_assets', 'asset_view_models', 'asset_transactions'],
+        'invoice.view'            => ['invoice_view', 'invoice_new'],
+        'inspection.view'         => ['insp_new', 'insp_completed', 'insp_templates'],
+        'tools.view'              => ['tools_bubble', 'tools_cad', 'tools_weight', 'tools_calc'],
+        'inventory_shiprcpt.view' => ['inventory_shipments_list'],
+    ];
+    foreach ($navInherit as $parentPerm => $childCodes) {
+        if (in_array($parentPerm, $perms, true)) {
+            foreach ($childCodes as $cc) $moduleCodes[$cc] = true;
+        }
+    }
 
     $in   = implode(',', array_fill(0, count($moduleCodes), '?'));
     $rows = db_all(

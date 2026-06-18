@@ -254,6 +254,9 @@ $flashes   = flash_pull();
                     <div class="user-role"><?= h($user['email']) ?></div>
                 </div>
             </div>
+            <a href="<?= h(url('/account.php?action=password')) ?>" class="account-link">
+                🔑 Change password
+            </a>
             <a href="<?= h(url('/logout.php')) ?>" class="logout"
                data-shortcut="L" accesskey="l" data-no-spa>
                 <?= shortcut_label('Sign out', 'L') ?>

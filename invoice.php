@@ -46,6 +46,61 @@ function invoice_asset_txn_types_increasing()
 }
 
 /**
+ * Financial-year picklist (header-level). 2021-2022 … 2029-2030. Stored
+ * verbatim as the "YYYY-YYYY" string so legacy imported values (same shape)
+ * line up with what the form offers.
+ */
+function invoice_fy_options()
+{
+    $out = [];
+    for ($y = 2021; $y <= 2029; $y++) {
+        $out[] = $y . '-' . ($y + 1);
+    }
+    return $out;
+}
+
+/** Department picklist (header-level). */
+function invoice_dept_options()
+{
+    return ['Electronics', 'Mechanical', 'General'];
+}
+
+/** Ledger picklist (per line item). */
+function invoice_ledger_options()
+{
+    return [
+        'R&M Vehicle', 'Packing expenses', 'Inspection charges',
+        'Plant & machinery', 'Furniture & fixture', 'Tools consumable',
+        'staff welfare', 'Manufacturing expenses', 'Raw material', 'others',
+        'consumable', 'R & M Equipment', 'carriage inward', 'carriage outward',
+        'Printing & stationary', 'R & M Building', 'Telephone expenses',
+        'Travelling expenses',
+    ];
+}
+
+/**
+ * Render a single <select> for a constrained picklist (FY / Dept / Ledger).
+ * Mirrors the UOM pattern: when the current value isn't one of the known
+ * options (e.g. an odd legacy value adopted at import) we append a one-off
+ * <option> so the historic value still renders selected.
+ */
+function invoice_picklist_select(string $name, array $options, string $current, string $blankLabel, string $cssClass = ''): string
+{
+    $h    = static fn($s) => htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8');
+    $cls  = $cssClass !== '' ? ' class="' . $h($cssClass) . '"' : '';
+    $html = '<select name="' . $h($name) . '"' . $cls . '>';
+    $html .= '<option value="">' . $h($blankLabel) . '</option>';
+    foreach ($options as $opt) {
+        $sel   = ($current !== '' && $current === $opt) ? ' selected' : '';
+        $html .= '<option value="' . $h($opt) . '"' . $sel . '>' . $h($opt) . '</option>';
+    }
+    if ($current !== '' && !in_array($current, $options, true)) {
+        $html .= '<option value="' . $h($current) . '" selected>' . $h($current) . ' (legacy)</option>';
+    }
+    return $html . '</select>';
+}
+
+/**
  * Pre-fetch the pickable code sets for the new-invoice form. Returns:
  *   ['assets' => [{code, label}, ...], 'items' => [{code, label, uom, unit_cost, hsn?, gst?}, ...]]
  * Used to seed the line-item code selects + auto-fill UOM/price/etc.
@@ -74,6 +129,8 @@ function invoice_picker_options()
     );
     foreach ($rows as $r) {
         $opts[] = [
+            'kind'       => 'inv',
+            'code'       => (string)$r['code'],
             'value'      => 'inv:' . $r['code'],
             'label'      => (string)$r['label'],
             'uom'        => (string)$r['uom'],
@@ -90,6 +147,8 @@ function invoice_picker_options()
     );
     foreach ($rows as $r) {
         $opts[] = [
+            'kind'       => 'asset',
+            'code'       => (string)$r['code'],
             'value'      => 'asset:' . $r['code'],
             'label'      => (string)$r['label'],
             'uom'        => '',           // assets have no inherent UOM
@@ -145,24 +204,29 @@ function invoice_code_set($invoiceId)
  */
 function invoice_save_items($invoiceId)
 {
-    // Unified picker: each row posts a single item_pick[] value of
-    // the form "<kind>:<code>" (e.g. "asset:A-00042" or
-    // "inv:BRG-6204"). We split that into kind + code and continue
-    // with the same per-row parallel arrays for the other fields.
-    $picks  = (array)input('item_pick',  []);
-    $qtys   = (array)input('item_qty',   []);
-    $uoms   = (array)input('item_uom',   []);
-    $prices = (array)input('item_price', []);
-    $gsts   = (array)input('item_gst',   []);
-    $hsns   = (array)input('item_hsn',   []);
-    $notes  = (array)input('item_notes', []);
+    // Per-row Type chooser (Inventory / Asset / New item), mirroring the
+    // shipment create page. Each row posts a subtype plus three slot
+    // fields; only the one matching the subtype carries a value, the
+    // others are submitted blank. The remaining per-row fields (qty,
+    // price, …) ride along as parallel arrays.
+    $subtypes  = (array)input('item_subtype',   []);
+    $invCodes  = (array)input('item_inv_code',  []);
+    $assetCodes= (array)input('item_asset_code',[]);
+    $newNames  = (array)input('item_new_name',  []);
+    $qtys    = (array)input('item_qty',    []);
+    $uoms    = (array)input('item_uom',    []);
+    $prices  = (array)input('item_price',  []);
+    $gsts    = (array)input('item_gst',    []);
+    $hsns    = (array)input('item_hsn',    []);
+    $notes   = (array)input('item_notes',  []);
+    $ledgers = (array)input('item_ledger', []);
 
-    $n = max(count($picks), count($qtys), count($prices));
+    $n = max(count($subtypes), count($qtys), count($prices));
 
     db_exec('DELETE FROM invoice_items WHERE invoice_id = ?', [(int)$invoiceId]);
     $written = 0;
     for ($i = 0; $i < $n; $i++) {
-        $pick  = isset($picks[$i])  ? trim((string)$picks[$i])  : '';
+        $subtype = isset($subtypes[$i]) ? trim((string)$subtypes[$i]) : 'item';
         $qty   = isset($qtys[$i])   ? (float)$qtys[$i]   : 0;
         $uom   = isset($uoms[$i])   ? trim((string)$uoms[$i])   : 'pcs';
         $price = isset($prices[$i]) ? (float)$prices[$i] : 0;
@@ -170,31 +234,16 @@ function invoice_save_items($invoiceId)
         $gst   = $gstR === '' ? null : (float)$gstR;
         $hsn   = isset($hsns[$i])   ? trim((string)$hsns[$i])   : '';
         $note  = isset($notes[$i])  ? trim((string)$notes[$i])  : '';
+        $ledg  = isset($ledgers[$i]) ? trim((string)$ledgers[$i]) : '';
 
-        if ($pick === '') continue;             // skip empty rows
-        $parts = explode(':', $pick, 2);
-        if (count($parts) !== 2) continue;
-        $kindRaw = $parts[0];
-        $code    = trim($parts[1]);
-        // Map the picker's short kind tags to the DB ENUM values.
-        // The picker uses 'asset' and 'inv' (terser in option values);
-        // invoice_items.item_kind is 'asset' / 'inv_item'.
-        if      ($kindRaw === 'asset') $kind = 'asset';
-        elseif  ($kindRaw === 'inv')   $kind = 'inv_item';
-        else    continue;
-        if ($code === '') continue;
-        if ($qty <= 0)   $qty = 1;
-        if ($uom === '') $uom = 'pcs';
-
-        // Snapshot the description from the live source at save time.
-        $desc = '';
-        if ($kind === 'inv_item') {
-            $r = db_one(
-                'SELECT COALESCE(NULLIF(short_description, ""), name) AS d FROM inv_items WHERE code = ?',
-                [$code]
-            );
-            if ($r) $desc = (string)$r['d'];
-        } else {
+        // Resolve the row to (kind, code, description) from the active slot.
+        // Empty rows (nothing picked / typed) are skipped silently so the
+        // user can leave trailing blanks in the form.
+        $kind = ''; $code = ''; $desc = '';
+        if ($subtype === 'asset') {
+            $kind = 'asset';
+            $code = isset($assetCodes[$i]) ? trim((string)$assetCodes[$i]) : '';
+            if ($code === '') continue;
             $r = db_one(
                 'SELECT COALESCE(am.name, "") AS d
                    FROM assets a LEFT JOIN asset_models am ON am.id = a.model_id
@@ -202,15 +251,35 @@ function invoice_save_items($invoiceId)
                 [$code]
             );
             if ($r) $desc = (string)$r['d'];
+        } elseif ($subtype === 'new') {
+            // Free-text ad-hoc line: no inventory/asset master row. The
+            // typed name becomes the description; item_code stays blank.
+            $kind = 'custom';
+            $desc = isset($newNames[$i]) ? trim((string)$newNames[$i]) : '';
+            if ($desc === '') continue;
+            $desc = substr($desc, 0, 500);
+            $code = '';
+        } else {
+            $kind = 'inv_item';
+            $code = isset($invCodes[$i]) ? trim((string)$invCodes[$i]) : '';
+            if ($code === '') continue;
+            $r = db_one(
+                'SELECT COALESCE(NULLIF(short_description, ""), name) AS d FROM inv_items WHERE code = ?',
+                [$code]
+            );
+            if ($r) $desc = (string)$r['d'];
         }
+        if ($qty <= 0)   $qty = 1;
+        if ($uom === '') $uom = 'pcs';
 
         db_exec(
             'INSERT INTO invoice_items
                (invoice_id, sort_order, item_kind, item_code, description,
-                qty, uom, unit_price, gst_rate, hsn_code, notes)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                qty, uom, unit_price, gst_rate, hsn_code, notes, ledger)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             [(int)$invoiceId, $i, $kind, $code, $desc,
-             $qty, $uom, $price, $gst, $hsn ?: null, $note ?: null]
+             $qty, $uom, $price, $gst, $hsn ?: null, $note ?: null,
+             $ledg !== '' ? substr($ledg, 0, 64) : null]
         );
         $written++;
     }
@@ -245,6 +314,7 @@ function invoice_render_import_result(array $result, ?string $fatalError): void
                 <?php foreach ([
                     ['Source lines',  $result['row_total']    ?? 0, '#f3f4f6', '#374151'],
                     ['Created',       $result['inv_created']  ?? 0, '#d1fae5', '#065f46'],
+                    ['Updated',       $result['inv_updated']  ?? 0, '#cffafe', '#155e75'],
                     ['Pending',       $result['inv_pending']  ?? 0, '#dbeafe', '#1e40af'],
                     ['Approved',      $result['inv_approved'] ?? 0, '#ede9fe', '#5b21b6'],
                     ['Skipped (no vendor)', $result['inv_skipped'] ?? 0, '#fef9c3', '#854d0e'],
@@ -438,6 +508,8 @@ if ($action === 'import') {
                 <tr><th>Vendor</th><td>Matched from <code>companyname</code> → <code>vendors.name</code>, falling back to the vendor on the shipment that <code>trans_id</code> links to. Invoices with no resolvable vendor are skipped &amp; logged.</td></tr>
                 <tr><th>Item code</th><td><code>product_id</code> (= legacy <code>inventory_model_id</code>) is matched to the current <code>inv_items.code</code> and adopts its name. When it's 0 / the Misc placeholder / unknown, a synthetic <code>OLD-P-&lt;id&gt;</code> code + the legacy product name is used.</td></tr>
                 <tr><th>Linking (<code>trans_id</code>)</th><td>Matched to the shipment list's <strong>Txn ID</strong> (<code>inv_shipment_lines.old_transaction_id</code>). For each match, a stock-neutral <code>inv_receipt</code> anchor is created on that shipment line and the invoice line is linked to it — so the invoice shows under <em>Linked transactions</em> and the shipment shows the invoiced qty. The <code>trans_id</code> is also recorded on the line (<code>OLD-TRANS-&lt;id&gt;</code>).</td></tr>
+                <tr><th>FY / Dept / Ledger</th><td><code>financialyear</code> &amp; <code>department</code> populate the invoice header (<code>fy</code> / <code>dept</code>); <code>ledger</code> populates each line item.</td></tr>
+                <tr><th>Re-running</th><td><strong>Upsert.</strong> An invoice already on file (matched by <code>invoice_no</code> + vendor + FY) is <em>updated</em> in place — header refreshed and line items replaced; anything new is created. No duplicates, so a clean delete-all first is optional.</td></tr>
             </table>
 
             <!-- Reset -->
@@ -445,8 +517,8 @@ if ($action === 'import') {
             <div style="background:#fff5f5;border:1px solid #fecaca;border-radius:8px;padding:16px 20px;margin-bottom:24px;">
                 <p style="margin:0 0 12px;font-size:14px;color:#7f1d1d;">
                     <strong>Delete All Invoices</strong> — permanently removes <em>every</em> invoice in the
-                    system (headers, line items, links, and attachments). Run this before a clean re-import
-                    to avoid duplicates.
+                    system (headers, line items, links, and attachments). Re-importing already updates
+                    existing invoices in place, so this is only needed for a full from-scratch reload.
                 </p>
                 <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:14px;">
                     <div style="text-align:center;min-width:80px;">
@@ -495,10 +567,13 @@ if ($action === 'save') {
 
     $id          = (int)input('id', 0);
     $invoiceNo   = trim((string)input('invoice_no', ''));
+    $refno       = substr(trim((string)input('refno', '')), 0, 32);
     $invoiceDate = trim((string)input('invoice_date', ''));
     $vendorId    = (int)input('vendor_id', 0);
     $currency    = trim((string)input('currency', 'INR')) ?: 'INR';
     $notes       = trim((string)input('notes', ''));
+    $fy          = trim((string)input('fy', ''));
+    $dept        = trim((string)input('dept', ''));
 
     // Validate header
     $errors = [];
@@ -511,11 +586,19 @@ if ($action === 'save') {
     // Quick scan of submitted items — we don't fully validate here
     // (invoice_save_items skips empties + does its own checks) but we
     // do require at least one non-empty row so the user can't create
-    // a totally empty invoice.
-    $submittedPicks = (array)input('item_pick', []);
+    // a totally empty invoice. A row counts if its active slot
+    // (inventory code / asset code / new-item name) carries a value.
+    $subRows   = (array)input('item_subtype',    []);
+    $invRows   = (array)input('item_inv_code',   []);
+    $assetRows = (array)input('item_asset_code', []);
+    $newRows   = (array)input('item_new_name',   []);
     $hasAnyLine = false;
-    foreach ($submittedPicks as $p) {
-        if (trim((string)$p) !== '') { $hasAnyLine = true; break; }
+    foreach ($subRows as $ri2 => $st) {
+        $st = trim((string)$st);
+        if ($st === 'asset')   { $v = trim((string)($assetRows[$ri2] ?? '')); }
+        elseif ($st === 'new') { $v = trim((string)($newRows[$ri2]   ?? '')); }
+        else                   { $v = trim((string)($invRows[$ri2]   ?? '')); }
+        if ($v !== '') { $hasAnyLine = true; break; }
     }
     if (!$hasAnyLine) $errors[] = 'Add at least one line item.';
 
@@ -535,12 +618,16 @@ if ($action === 'save') {
             db_exec(
                 'UPDATE invoices
                     SET invoice_no   = ?,
+                        refno        = ?,
                         invoice_date = ?,
                         vendor_id    = ?,
                         currency     = ?,
-                        notes        = ?
+                        notes        = ?,
+                        fy           = ?,
+                        dept         = ?
                   WHERE id = ?',
-                [$invoiceNo, $invoiceDate, $vendorId, $currency, $notes ?: null, $id]
+                [$invoiceNo, $refno !== '' ? $refno : null, $invoiceDate, $vendorId, $currency, $notes ?: null,
+                 $fy !== '' ? $fy : null, $dept !== '' ? $dept : null, $id]
             );
         } catch (\Throwable $e) {
             flash_set('error', 'Could not save invoice: ' . $e->getMessage());
@@ -557,9 +644,10 @@ if ($action === 'save') {
         try {
             db_exec(
                 'INSERT INTO invoices
-                   (invoice_no, invoice_date, vendor_id, currency, status, notes, created_by)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)',
-                [$invoiceNo, $invoiceDate, $vendorId, $currency, 'pending', $notes ?: null, $uid]
+                   (invoice_no, refno, invoice_date, vendor_id, currency, status, notes, fy, dept, created_by)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [$invoiceNo, $refno !== '' ? $refno : null, $invoiceDate, $vendorId, $currency, 'pending', $notes ?: null,
+                 $fy !== '' ? $fy : null, $dept !== '' ? $dept : null, $uid]
             );
         } catch (\Throwable $e) {
             flash_set('error', 'Could not save invoice: ' . $e->getMessage());
@@ -864,10 +952,15 @@ if ($action === 'new' || $action === 'edit') {
     }
 
     $vInvoiceNo   = $inv['invoice_no']   ?? '';
+    // refno is a free-text reference the user types (accepts letters too).
+    // Optional — leave blank if there's none.
+    $vRefno       = $inv['refno']        ?? '';
     $vInvoiceDate = $inv['invoice_date'] ?? date('Y-m-d');
     $vVendorId    = (int)($inv['vendor_id'] ?? $prefillVendorId);
     $vCurrency    = $inv['currency']     ?? 'INR';
     $vNotes       = $inv['notes']        ?? '';
+    $vFy          = (string)($inv['fy']   ?? '');
+    $vDept        = (string)($inv['dept'] ?? '');
 
     // Ensure we always render at least one empty row so the user has
     // somewhere to start.
@@ -899,6 +992,12 @@ if ($action === 'new' || $action === 'edit') {
                 <span class="muted small">As issued by the vendor.</span>
             </div>
             <div class="field">
+                <label for="f_refno">Ref #</label>
+                <input id="f_refno" name="refno" type="text" maxlength="32"
+                       value="<?= h($vRefno) ?>" placeholder="e.g. 402 or PO-2026/17">
+                <span class="muted small">Optional reference number — accepts text.</span>
+            </div>
+            <div class="field">
                 <label for="f_invoice_date">Invoice date <span class="required">*</span></label>
                 <input id="f_invoice_date" name="invoice_date" type="date" required
                        value="<?= h($vInvoiceDate) ?>">
@@ -921,6 +1020,14 @@ if ($action === 'new' || $action === 'edit') {
                 <label for="f_currency">Currency</label>
                 <input id="f_currency" name="currency" type="text" maxlength="8"
                        value="<?= h($vCurrency) ?>" placeholder="INR">
+            </div>
+            <div class="field">
+                <label for="f_fy">FY</label>
+                <?= invoice_picklist_select('fy', invoice_fy_options(), $vFy, '— pick financial year —') ?>
+            </div>
+            <div class="field">
+                <label for="f_dept">Dept</label>
+                <?= invoice_picklist_select('dept', invoice_dept_options(), $vDept, '— pick department —') ?>
             </div>
         </div>
 
@@ -982,6 +1089,11 @@ if ($action === 'new' || $action === 'edit') {
                the wrap takes full cell width here. */
             .inv-items-table .cb-wrap { width: 100%; }
 
+            /* Type chooser slots: each fills the cell; only one shows at a
+               time (toggled by the subtype select via JS). */
+            .inv-items-table .inv-slot { display: block; }
+            .inv-items-table .inv-slot .inv-item-newname { width: 100%; box-sizing: border-box; }
+
             /* Subtotal row: heavier border on top, no row-hover. */
             .inv-items-table tfoot td { border-top: 2px solid var(--border); padding-top: 10px; }
         </style>
@@ -989,12 +1101,14 @@ if ($action === 'new' || $action === 'edit') {
         <table class="data-table inv-items-table" id="invoice-items-tbl">
             <thead>
                 <tr>
+                    <th style="width: 120px;">Type</th>
                     <th>Code & description</th>
                     <th class="r" style="width: 90px;">Qty</th>
                     <th style="width: 90px;">UOM</th>
                     <th class="r" style="width: 120px;">Unit price</th>
                     <th class="r" style="width: 80px;">GST %</th>
                     <th style="width: 110px;">HSN</th>
+                    <th style="width: 150px;">Ledger</th>
                     <th class="r" style="width: 120px;">Line total</th>
                     <th style="width: 44px;"></th>
                 </tr>
@@ -1004,41 +1118,86 @@ if ($action === 'new' || $action === 'edit') {
                 $isExisting = is_array($it);
                 $iKind  = $isExisting ? $it['item_kind']   : '';
                 $iCode  = $isExisting ? $it['item_code']   : '';
-                $iPick  = $isExisting
-                    ? (($iKind === 'asset' ? 'asset:' : 'inv:') . $iCode)
-                    : '';
+                // Subtype drives which of the three slots (inventory item /
+                // asset / free-text new item) is visible for this row.
+                $iSubtype = $iKind === 'asset'  ? 'asset'
+                          : ($iKind === 'custom' ? 'new' : 'item');
+                // Per-slot selected values. For inv/asset the picked option
+                // is the item_code; for a "new item" the typed name lives in
+                // description (item_code stays blank for custom rows).
+                $iInvCode   = $iKind === 'inv_item' ? $iCode : '';
+                $iAssetCode = $iKind === 'asset'    ? $iCode : '';
+                $iNewName   = $iKind === 'custom'   ? ($it['description'] ?? '') : '';
                 $iQty   = $isExisting ? rtrim(rtrim(number_format((float)$it['qty'], 3, '.', ''), '0'), '.') : '';
                 $iUom   = $isExisting ? $it['uom']         : 'pcs';
                 $iPrice = $isExisting ? rtrim(rtrim(number_format((float)$it['unit_price'], 4, '.', ''), '0'), '.') : '';
                 $iGst   = $isExisting && $it['gst_rate'] !== null
                             ? rtrim(rtrim(number_format((float)$it['gst_rate'], 2, '.', ''), '0'), '.') : '';
                 $iHsn   = $isExisting ? ($it['hsn_code'] ?? '') : '';
-                // Has the saved pick survived in the picker's current
-                // option list? If the inv item / asset was removed or
-                // deactivated we still want the row to render with the
-                // historic value selected, so we tack on a one-off
-                // option below when needed.
-                $inPicker = false;
-                foreach ($picker as $po) { if ($po['value'] === $iPick) { $inPicker = true; break; } }
+                $iLedger = $isExisting ? ($it['ledger'] ?? '') : '';
+                // Has the saved code survived in its picker list? If the inv
+                // item / asset was removed or deactivated we still want the
+                // row to render with the historic value selected, so we tack
+                // on a one-off option below when needed.
+                $invInPicker = $iInvCode === '';
+                $assetInPicker = $iAssetCode === '';
+                foreach ($picker as $po) {
+                    if ($po['kind'] === 'inv'   && $po['code'] === $iInvCode)   $invInPicker = true;
+                    if ($po['kind'] === 'asset' && $po['code'] === $iAssetCode) $assetInPicker = true;
+                }
             ?>
-                <tr class="inv-item-row">
+                <tr class="inv-item-row" data-subtype="<?= h($iSubtype) ?>">
                     <td>
-                        <select name="item_pick[]" class="inv-item-pick">
-                            <option value="">— pick an item (search by code or name) —</option>
-                            <?php foreach ($picker as $opt): ?>
-                                <option value="<?= h($opt['value']) ?>"
-                                        data-uom="<?= h($opt['uom']) ?>"
-                                        data-price="<?= h($opt['unit_cost'] ?? '') ?>"
-                                        <?= $opt['value'] === $iPick ? 'selected' : '' ?>>
-                                    <?= h($opt['label']) ?>
-                                </option>
-                            <?php endforeach; ?>
-                            <?php if ($iPick !== '' && !$inPicker): ?>
-                                <option value="<?= h($iPick) ?>" selected>
-                                    <?= h($iCode) ?> — (inactive / removed)
-                                </option>
-                            <?php endif; ?>
+                        <select name="item_subtype[]" class="no-combobox inv-item-subtype">
+                            <option value="item"  <?= $iSubtype === 'item'  ? 'selected' : '' ?>>Inventory</option>
+                            <option value="asset" <?= $iSubtype === 'asset' ? 'selected' : '' ?>>Asset</option>
+                            <option value="new"   <?= $iSubtype === 'new'   ? 'selected' : '' ?>>New item</option>
                         </select>
+                    </td>
+                    <td>
+                        <!-- Slot: inventory item -->
+                        <span class="inv-slot inv-slot-item" style="<?= $iSubtype === 'item' ? '' : 'display:none;' ?>">
+                            <select name="item_inv_code[]" class="inv-item-pick">
+                                <option value="">— pick an item (search by code or name) —</option>
+                                <?php foreach ($picker as $opt): if ($opt['kind'] !== 'inv') continue; ?>
+                                    <option value="<?= h($opt['code']) ?>"
+                                            data-uom="<?= h($opt['uom']) ?>"
+                                            data-price="<?= h($opt['unit_cost'] ?? '') ?>"
+                                            <?= $opt['code'] === $iInvCode ? 'selected' : '' ?>>
+                                        <?= h($opt['label']) ?>
+                                    </option>
+                                <?php endforeach; ?>
+                                <?php if ($iInvCode !== '' && !$invInPicker): ?>
+                                    <option value="<?= h($iInvCode) ?>" selected>
+                                        <?= h($iInvCode) ?> — (inactive / removed)
+                                    </option>
+                                <?php endif; ?>
+                            </select>
+                        </span>
+                        <!-- Slot: asset -->
+                        <span class="inv-slot inv-slot-asset" style="<?= $iSubtype === 'asset' ? '' : 'display:none;' ?>">
+                            <select name="item_asset_code[]" class="inv-item-asset">
+                                <option value="">— pick an asset —</option>
+                                <?php foreach ($picker as $opt): if ($opt['kind'] !== 'asset') continue; ?>
+                                    <option value="<?= h($opt['code']) ?>"
+                                            <?= $opt['code'] === $iAssetCode ? 'selected' : '' ?>>
+                                        <?= h($opt['label']) ?>
+                                    </option>
+                                <?php endforeach; ?>
+                                <?php if ($iAssetCode !== '' && !$assetInPicker): ?>
+                                    <option value="<?= h($iAssetCode) ?>" selected>
+                                        <?= h($iAssetCode) ?> — (inactive / removed)
+                                    </option>
+                                <?php endif; ?>
+                            </select>
+                        </span>
+                        <!-- Slot: new (ad-hoc) item -->
+                        <span class="inv-slot inv-slot-new" style="<?= $iSubtype === 'new' ? '' : 'display:none;' ?>">
+                            <input type="text" maxlength="190" name="item_new_name[]"
+                                   class="inv-item-newname"
+                                   value="<?= h($iNewName) ?>"
+                                   placeholder="New item name / description">
+                        </span>
                     </td>
                     <td class="r">
                         <input type="number" step="0.001" min="0" class="inv-item-qty r"
@@ -1069,6 +1228,9 @@ if ($action === 'new' || $action === 'edit') {
                         <input type="text" maxlength="16" name="item_hsn[]"
                                value="<?= h($iHsn) ?>" placeholder="HSN">
                     </td>
+                    <td>
+                        <?= invoice_picklist_select('item_ledger[]', invoice_ledger_options(), (string)$iLedger, '— ledger —', 'no-combobox') ?>
+                    </td>
                     <td class="r inv-item-total muted">—</td>
                     <td class="r">
                         <button type="button" class="btn btn-icon btn-danger inv-item-remove"
@@ -1079,7 +1241,7 @@ if ($action === 'new' || $action === 'edit') {
             </tbody>
             <tfoot>
                 <tr>
-                    <td colspan="6" class="r"><strong>Subtotal (qty × price, GST extra):</strong></td>
+                    <td colspan="8" class="r"><strong>Subtotal (qty × price, GST extra):</strong></td>
                     <td class="r"><strong id="invoice-items-subtotal">—</strong></td>
                     <td></td>
                 </tr>
@@ -1164,12 +1326,34 @@ if ($action === 'new' || $action === 'edit') {
             }
         }
 
+        // Show only the slot matching the row's subtype (Inventory / Asset
+        // / New item), and stamp data-subtype for any CSS / debugging.
+        function applySubtype(row) {
+            var sel = row.querySelector('.inv-item-subtype');
+            if (!sel) return;
+            var v = sel.value;
+            var slots = {
+                item:  row.querySelector('.inv-slot-item'),
+                asset: row.querySelector('.inv-slot-asset'),
+                'new': row.querySelector('.inv-slot-new')
+            };
+            Object.keys(slots).forEach(function (k) {
+                if (slots[k]) slots[k].style.display = (k === v) ? '' : 'none';
+            });
+            row.setAttribute('data-subtype', v);
+        }
+
         function wireRow(row) {
             if (row._wired) return;
             row._wired = true;
-            row.querySelector('.inv-item-pick').addEventListener('change', function () {
-                autoFillFromPick(row);
-            });
+            var subSel = row.querySelector('.inv-item-subtype');
+            if (subSel) {
+                subSel.addEventListener('change', function () { applySubtype(row); });
+            }
+            var pick = row.querySelector('.inv-item-pick');
+            if (pick) {
+                pick.addEventListener('change', function () { autoFillFromPick(row); });
+            }
             row.querySelectorAll('.inv-item-qty, .inv-item-price').forEach(function (inp) {
                 inp.addEventListener('input', function () { recalcRow(row); });
             });
@@ -1178,6 +1362,7 @@ if ($action === 'new' || $action === 'edit') {
                 row.parentNode.removeChild(row);
                 recalcSubtotal();
             });
+            applySubtype(row);
             recalcRow(row);
         }
 
@@ -1396,9 +1581,12 @@ if ($action === 'view') {
     <div class="card" style="padding: 18px; margin-bottom: 14px;">
         <div class="grid-2col">
             <div><div class="muted small">Invoice #</div><div><strong><?= h($inv['invoice_no']) ?></strong></div></div>
+            <div><div class="muted small">Ref #</div><div><?= $inv['refno'] !== null && $inv['refno'] !== '' ? h($inv['refno']) : '—' ?></div></div>
             <div><div class="muted small">Status</div><div><?= $statusPill ?></div></div>
             <div><div class="muted small">Date</div><div><?= h($inv['invoice_date']) ?></div></div>
             <div><div class="muted small">Vendor</div><div><?= $vendor ? '<code>' . h($vendor['code']) . '</code> ' . h($vendor['name']) : '—' ?></div></div>
+            <div><div class="muted small">FY</div><div><?= $inv['fy'] !== null && $inv['fy'] !== '' ? h($inv['fy']) : '—' ?></div></div>
+            <div><div class="muted small">Dept</div><div><?= $inv['dept'] !== null && $inv['dept'] !== '' ? h($inv['dept']) : '—' ?></div></div>
             <?php if ($inv['status'] === 'approved' && $approver): ?>
                 <div><div class="muted small">Approved by</div><div><?= h($approver['full_name']) ?> · <?= h(substr((string)$inv['approved_at'], 0, 16)) ?></div></div>
             <?php endif; ?>
@@ -1441,6 +1629,7 @@ if ($action === 'view') {
                         <th class="r">Unlinked</th>
                         <th class="r">GST %</th>
                         <th>HSN</th>
+                        <th>Ledger</th>
                         <th class="r">Line total</th>
                     </tr>
                 </thead>
@@ -1454,8 +1643,8 @@ if ($action === 'view') {
                     ?>
                     <tr>
                         <td class="muted"><?= $rn++ ?></td>
-                        <td><span class="muted small"><?= h($it['item_kind'] === 'asset' ? 'asset' : 'inv') ?></span></td>
-                        <td><code><?= h($it['item_code']) ?></code></td>
+                        <td><span class="muted small"><?= h($it['item_kind'] === 'asset' ? 'asset' : ($it['item_kind'] === 'custom' ? 'new' : 'inv')) ?></span></td>
+                        <td><?= $it['item_code'] !== '' ? '<code>' . h($it['item_code']) . '</code>' : '<span class="muted">—</span>' ?></td>
                         <td><?= h($it['description'] ?: '—') ?></td>
                         <td class="r"><?= h(rtrim(rtrim(number_format((float)$it['qty'], 3, '.', ''), '0'), '.')) ?></td>
                         <td><?= h($it['uom']) ?></td>
@@ -1464,22 +1653,23 @@ if ($action === 'view') {
                         <td class="r"><?php if ($qUnlinked > 0): ?><strong style="color:#b45309"><?= h($unlinkedDisp) ?></strong><?php else: ?><span class="muted">0</span><?php endif; ?></td>
                         <td class="r"><?= $it['gst_rate'] !== null ? h(rtrim(rtrim(number_format((float)$it['gst_rate'], 2, '.', ''), '0'), '.')) . '%' : '—' ?></td>
                         <td><?= h($it['hsn_code'] ?: '—') ?></td>
+                        <td><?= h($it['ledger'] ?: '—') ?></td>
                         <td class="r"><?= h(number_format($lt, 2)) ?></td>
                     </tr>
                 <?php endforeach; ?>
                 </tbody>
                 <tfoot>
                     <tr>
-                        <td colspan="11" class="r"><strong>Subtotal</strong></td>
+                        <td colspan="12" class="r"><strong>Subtotal</strong></td>
                         <td class="r"><strong><?= h($inv['currency']) ?> <?= h(number_format($subtotal, 2)) ?></strong></td>
                     </tr>
                     <?php if ($gstTotal > 0): ?>
                     <tr>
-                        <td colspan="11" class="r muted">GST</td>
+                        <td colspan="12" class="r muted">GST</td>
                         <td class="r muted"><?= h($inv['currency']) ?> <?= h(number_format($gstTotal, 2)) ?></td>
                     </tr>
                     <tr>
-                        <td colspan="11" class="r"><strong>Total (incl. GST)</strong></td>
+                        <td colspan="12" class="r"><strong>Total (incl. GST)</strong></td>
                         <td class="r"><strong><?= h($inv['currency']) ?> <?= h(number_format($subtotal + $gstTotal, 2)) ?></strong></td>
                     </tr>
                     <?php endif; ?>
@@ -1714,7 +1904,7 @@ if ($action === 'links') {
             $qtyTotal  = (float)$it['qty'];
             $qtyLinked = invoice_item_qty_linked($iid);
             $qtyOpen   = max(0.0, $qtyTotal - $qtyLinked);
-            $kindLabel = $it['item_kind'] === 'asset' ? 'Asset' : 'Inv item';
+            $kindLabel = $it['item_kind'] === 'asset' ? 'Asset' : ($it['item_kind'] === 'custom' ? 'New item' : 'Inv item');
             $cand      = $candidates[$iid];
             ?>
             <div class="card" style="margin-bottom:14px;">
@@ -1722,7 +1912,7 @@ if ($action === 'links') {
                     <div style="display:flex;justify-content:space-between;align-items:baseline;gap:14px;flex-wrap:wrap;">
                         <div>
                             <span class="muted small"><?= h($kindLabel) ?></span>
-                            <strong>(<?= h($it['item_code']) ?>)-<?= h($it['description'] ?: '—') ?></strong>
+                            <strong><?= $it['item_kind'] === 'custom' ? h($it['description'] ?: '—') : '(' . h($it['item_code']) . ')-' . h($it['description'] ?: '—') ?></strong>
                         </div>
                         <div class="muted small">
                             Qty <strong><?= h(rtrim(rtrim(number_format($qtyTotal, 3), '0'), '.')) ?></strong> <?= h($it['uom']) ?>
@@ -2242,9 +2432,12 @@ $dtCfg = [
     'id'       => 'invoices',
     'base_sql' => "SELECT inv.id            AS invoice_id,
                           inv.invoice_no,
+                          inv.refno,
                           inv.invoice_date,
                           inv.vendor_id,
                           inv.currency,
+                          inv.fy,
+                          inv.dept,
                           inv.status,
                           v.code            AS vendor_code,
                           v.name            AS vendor_name,
@@ -2255,6 +2448,7 @@ $dtCfg = [
                           ii.description    AS item_desc,
                           ii.qty            AS item_qty,
                           ii.uom            AS item_uom,
+                          ii.ledger         AS item_ledger,
                           ii.unit_price,
                           (ii.qty * ii.unit_price) AS line_total,
                           COALESCE(
@@ -2274,8 +2468,15 @@ $dtCfg = [
                 LEFT JOIN invoice_items ii   ON ii.invoice_id = inv.id",
     'columns'  => [
         ['key'=>'invoice_no',   'label'=>'Invoice #',  'sortable'=>true, 'searchable'=>true, 'sql_col'=>'inv.invoice_no'],
+        ['key'=>'refno',        'label'=>'Ref #',      'sortable'=>true, 'searchable'=>true, 'sql_col'=>'inv.refno', 'th_class'=>'r','td_class'=>'r'],
         ['key'=>'invoice_date', 'label'=>'Date',       'sortable'=>true, 'sql_col'=>'inv.invoice_date'],
         ['key'=>'vendor',       'label'=>'Vendor',     'sortable'=>true, 'searchable'=>true, 'sql_col'=>'v.name'],
+        ['key'=>'fy',           'label'=>'FY',         'sortable'=>true, 'searchable'=>true, 'sql_col'=>'inv.fy',
+         'filter' => ['type'=>'select','placeholder'=>'all','options'=>array_map(
+             fn($f) => ['value'=>$f,'label'=>$f], invoice_fy_options())]],
+        ['key'=>'dept',         'label'=>'Dept',       'sortable'=>true, 'searchable'=>true, 'sql_col'=>'inv.dept',
+         'filter' => ['type'=>'select','placeholder'=>'all','options'=>array_map(
+             fn($d) => ['value'=>$d,'label'=>$d], invoice_dept_options())]],
         ['key'=>'item_kind',    'label'=>'Kind',       'sortable'=>true, 'searchable'=>true, 'sql_col'=>'ii.item_kind',
          'filter' => ['type'=>'select','placeholder'=>'all','options'=>[
              ['value'=>'asset',    'label'=>'Asset'],
@@ -2285,6 +2486,9 @@ $dtCfg = [
          // Searchable on both code and description, displayed as
          // (CODE)-Description per the app-wide convention.
          'sql_col'=>"CONCAT('(', COALESCE(ii.item_code, ''), ')-', COALESCE(ii.description, ''))"],
+        ['key'=>'item_ledger',  'label'=>'Ledger',     'sortable'=>true, 'searchable'=>true, 'sql_col'=>'ii.ledger',
+         'filter' => ['type'=>'select','placeholder'=>'all','options'=>array_map(
+             fn($l) => ['value'=>$l,'label'=>$l], invoice_ledger_options())]],
         ['key'=>'item_qty',     'label'=>'Qty',        'sortable'=>true, 'searchable'=>false, 'sql_col'=>'ii.qty',         'th_class'=>'r','td_class'=>'r'],
         ['key'=>'qty_linked',   'label'=>'Linked',     'sortable'=>false,'searchable'=>false, 'th_class'=>'r','td_class'=>'r'],
         ['key'=>'qty_unlinked', 'label'=>'Unlinked',   'sortable'=>false,'searchable'=>false, 'th_class'=>'r','td_class'=>'r'],
@@ -2327,10 +2531,14 @@ $rowRenderer = function ($r) use ($canManage) {
         return [
             'invoice_no'   => '<strong><a href="' . h(url('/invoice.php?action=view&id=' . (int)$r['invoice_id'])) . '">'
                               . h($r['invoice_no']) . '</a></strong>',
+            'refno'        => ($r['refno'] !== null && $r['refno'] !== '') ? h($r['refno']) : '—',
             'invoice_date' => h($r['invoice_date']),
             'vendor'       => $vendor,
+            'fy'           => ($r['fy']   !== null && $r['fy']   !== '') ? h($r['fy'])   : '—',
+            'dept'         => ($r['dept'] !== null && $r['dept'] !== '') ? h($r['dept']) : '—',
             'item_kind'    => '<span class="muted small">no items</span>',
             'item_label'   => '<span class="muted small">(no line items)</span>',
+            'item_ledger'  => '—',
             'item_qty'     => '—',
             'qty_linked'   => '—',
             'qty_unlinked' => '—',
@@ -2342,9 +2550,14 @@ $rowRenderer = function ($r) use ($canManage) {
 
     $kindPill = $r['item_kind'] === 'asset'
         ? '<span class="pill pill-info">asset</span>'
-        : '<span class="pill pill-neutral">inv item</span>';
+        : ($r['item_kind'] === 'custom'
+            ? '<span class="pill pill-warn">new item</span>'
+            : '<span class="pill pill-neutral">inv item</span>');
 
-    $itemLabel = '(' . h($r['item_code']) . ')-' . h($r['item_desc'] ?: '—');
+    // Custom (ad-hoc) lines have no item_code — show just the description.
+    $itemLabel = $r['item_kind'] === 'custom'
+        ? h($r['item_desc'] ?: '—')
+        : '(' . h($r['item_code']) . ')-' . h($r['item_desc'] ?: '—');
 
     $qtyLinked   = (float)$r['qty_linked'];
     $qtyUnlinked = (float)$r['qty_unlinked'];
@@ -2382,10 +2595,14 @@ $rowRenderer = function ($r) use ($canManage) {
     return [
         'invoice_no'   => '<strong><a href="' . h(url('/invoice.php?action=view&id=' . (int)$r['invoice_id'])) . '">'
                           . h($r['invoice_no']) . '</a></strong>',
+        'refno'        => ($r['refno'] !== null && $r['refno'] !== '') ? h($r['refno']) : '—',
         'invoice_date' => h($r['invoice_date']),
         'vendor'       => $vendor,
+        'fy'           => ($r['fy']   !== null && $r['fy']   !== '') ? h($r['fy'])   : '—',
+        'dept'         => ($r['dept'] !== null && $r['dept'] !== '') ? h($r['dept']) : '—',
         'item_kind'    => $kindPill,
         'item_label'   => $itemLabel,
+        'item_ledger'  => ($r['item_ledger'] !== null && $r['item_ledger'] !== '') ? h($r['item_ledger']) : '<span class="muted">—</span>',
         'item_qty'     => h($fmt($r['item_qty'])) . ' <span class="muted small">' . h($r['item_uom']) . '</span>',
         'qty_linked'   => $linkedCell,
         'qty_unlinked' => $unlinkedCell,
@@ -2400,8 +2617,11 @@ $listActions = '';
 if ($canManage) {
     $listActions .= '<a class="btn btn-primary" href="' . h(url('/invoice.php?action=new')) . '"'
                   . ' data-shortcut="N" accesskey="n">' . shortcut_label('+ New invoice', 'N') . '</a> ';
-    $listActions .= '<a class="btn btn-ghost" href="' . h(url('/invoice.php?action=import')) . '">'
-                  . '⬇ Import from Old Inventory</a>';
+    // Old-inventory import is admin-only and lives under Admin ▸ Old Inventory Import.
+    if (is_admin()) {
+        $listActions .= '<a class="btn btn-ghost" href="' . h(url('/invoice.php?action=import')) . '">'
+                      . '⬇ Import from Old Inventory</a>';
+    }
 }
 $dtCfg['title']        = 'Invoices';
 $dtCfg['description']  = 'One row per invoice line item. Each line tracks how much of its qty is linked to receipts / asset transactions. The Link column opens the per-line linker.';

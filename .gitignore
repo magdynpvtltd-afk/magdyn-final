@@ -4,3 +4,4 @@ delta_*.zip
 
 # Claude Code tooling state
 .claude/
+uploads*

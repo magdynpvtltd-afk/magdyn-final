@@ -54,6 +54,10 @@
 // page render would silently skip applying the saved layout —
 // looking to the operator as though the panel did nothing.
 require_once __DIR__ . '/user_dt_prefs.php';
+// View-state persistence (filters / search / sort / page size). Sibling of
+// user_dt_prefs.php (which handles column layout). Used by data_table_state()
+// to restore the user's last-used view when the request carries no dt_* params.
+require_once __DIR__ . '/user_dt_view.php';
 
 /** Allowed page sizes; protects against arbitrary user input. */
 function data_table_page_sizes() { return [10, 25, 50, 100]; }
@@ -68,27 +72,56 @@ function data_table_default_size() { return 25; }
  *
  * Unknown column keys are silently dropped so users can't sort on hidden columns.
  */
+/**
+ * True when the current request carries ANY dt_* query param. Used to
+ * decide whether to restore the user's saved view: a fresh visit (sidebar
+ * link, typed URL) carries none, while bookmarks, shared links, in-page
+ * AJAX, and pagination all carry explicit dt_* params and must win.
+ */
+function data_table_request_has_dt_params()
+{
+    foreach (array_keys($_GET) as $k) {
+        if (strncmp((string)$k, 'dt_', 3) === 0) return true;
+    }
+    return false;
+}
+
 function data_table_state(array $cfg)
 {
     $allowedSizes = data_table_page_sizes();
     $defaultSize  = data_table_default_size();
     $colKeys      = array_column($cfg['columns'], 'key');
 
-    $sort = (string)input('dt_sort', '');
-    $dir  = strtolower((string)input('dt_dir', ''));
+    // Restore the user's saved view ONLY when the request carries no dt_*
+    // params (a fresh visit). Per-table opt-out via $cfg['save_state']=false.
+    $saved = null;
+    $saveEnabled = !(isset($cfg['save_state']) && $cfg['save_state'] === false);
+    if ($saveEnabled
+        && !data_table_request_has_dt_params()
+        && function_exists('current_user_id')) {
+        $saved = user_dt_view_load(current_user_id(), (string)($cfg['id'] ?? ''));
+    }
+
+    // ---- Sort + direction (saved view supplies the default) ----
+    $sort = (string)input('dt_sort', $saved['sort'] ?? '');
+    $dir  = strtolower((string)input('dt_dir', $saved['dir'] ?? ''));
     if (!in_array($sort, $colKeys, true)) {
         $sort = isset($cfg['default_sort'][0]) ? $cfg['default_sort'][0] : '';
         $dir  = isset($cfg['default_sort'][1]) ? $cfg['default_sort'][1] : 'asc';
     }
     if (!in_array($dir, ['asc', 'desc'], true)) $dir = 'asc';
 
+    // Page number is intentionally NOT restored — a remembered view always
+    // lands on page 1 with its filters applied.
     $page = max(1, (int)input('dt_page', 1));
-    $size = (int)input('dt_size', $defaultSize);
+
+    $size = (int)input('dt_size', $saved['size'] ?? $defaultSize);
     if (!in_array($size, $allowedSizes, true)) $size = $defaultSize;
 
-    $q = trim((string)input('dt_q', ''));
+    $q = trim((string)input('dt_q', $saved['q'] ?? ''));
 
-    $cols = (array)input('dt_col', []);
+    // ---- Per-column (server-side) filters ----
+    $cols = (array)input('dt_col', $saved ? $saved['col'] : []);
     $colFilters = [];
     foreach ($cols as $k => $v) {
         if (in_array($k, $colKeys, true)) {
@@ -97,13 +130,28 @@ function data_table_state(array $cfg)
         }
     }
 
+    // ---- Client-side (DOM-only) filters ----
+    // These never travel in the URL or hit the SQL query — they hide rows
+    // in the browser. We only carry SAVED values through so the rendered
+    // <input> can be pre-populated and re-applied on load by datatable.js.
+    $clientFilters = [];
+    if ($saved && !empty($saved['client'])) {
+        foreach ($saved['client'] as $k => $v) {
+            if (in_array($k, $colKeys, true)) {
+                $val = trim((string)$v);
+                if ($val !== '') $clientFilters[$k] = $val;
+            }
+        }
+    }
+
     return [
-        'sort'        => $sort,
-        'dir'         => $dir,
-        'page'        => $page,
-        'page_size'   => $size,
-        'q'           => $q,
-        'col_filters' => $colFilters,
+        'sort'           => $sort,
+        'dir'            => $dir,
+        'page'           => $page,
+        'page_size'      => $size,
+        'q'              => $q,
+        'col_filters'    => $colFilters,
+        'client_filters' => $clientFilters,
     ];
 }
 
@@ -328,14 +376,26 @@ function data_table_render(array $cfg, array $dt, callable $rowRenderer)
         }
     })();
     </script>
+    <?php
+        // View-state save is on for every table unless explicitly opted out
+        // with $cfg['save_state'] === false. It persists filters/search/sort/
+        // page-size per user so the list comes back as the user left it.
+        $saveStateEnabled = !(isset($cfg['save_state']) && $cfg['save_state'] === false);
+    ?>
     <div class="dt-wrap" data-dt-id="<?= $id ?>"<?php
+        // CSRF token is needed by BOTH the column-prefs JS and the
+        // view-state save JS, so emit it whenever either is enabled.
+        if ($prefsEnabled || $saveStateEnabled) {
+            echo ' data-dt-csrf="' . h(function_exists('csrf_token') ? csrf_token() : '') . '"';
+        }
         if ($prefsEnabled) {
-            // Pass the registry of all columns (visible + hidden) and
-            // CSRF token to the JS. We use JSON inside a data- attr; the
-            // JS reads it with JSON.parse(getAttribute()).
+            // Pass the registry of all columns (visible + hidden) to the JS.
+            // The JS reads it with JSON.parse(getAttribute()).
             echo ' data-dt-allcols="' . h(json_encode($allColsJson, JSON_UNESCAPED_SLASHES)) . '"';
-            echo ' data-dt-csrf="'    . h(function_exists('csrf_token') ? csrf_token() : '') . '"';
             echo ' data-dt-prefs="1"';
+        }
+        if ($saveStateEnabled) {
+            echo ' data-dt-savestate="1"';
         }
     ?>>
         <div class="dt-toolbar">
@@ -384,9 +444,22 @@ function data_table_render(array $cfg, array $dt, callable $rowRenderer)
                     $cls      = isset($c['th_class']) ? $c['th_class'] : '';
                     // The data-dt-colkey attribute identifies the column for
                     // the resize JS, which persists widths in localStorage.
+                    // A saved per-user width (applied by user_dt_prefs_apply as
+                    // $c['width'], e.g. "120px") is rendered as an inline width
+                    // so it takes effect on first paint — cross-device and with
+                    // no dependency on localStorage. datatable.js detects this
+                    // inline width and switches the table to fixed layout.
+                    $colW = '';
+                    if (!empty($c['width'])) {
+                        $w = (string)$c['width'];
+                        // Accept "120" or "120px"; normalise to px.
+                        if (preg_match('/^\d+$/', $w))            $colW = $w . 'px';
+                        elseif (preg_match('/^\d+px$/', $w))      $colW = $w;
+                    }
                 ?>
                     <th class="<?= h($cls) ?><?= $sortable ? ' dt-sortable' : '' ?><?= $isSort ? ' dt-sorted dt-sorted-' . h($dt['dir']) : '' ?>"
                         data-dt-colkey="<?= h($c['key']) ?>"
+                        <?= $colW !== '' ? 'style="width:' . h($colW) . '"' : '' ?>
                         <?php if ($sortable): ?>
                             data-dt-sort="<?= h($c['key']) ?>"
                             data-dt-dir="<?= h($nextDir) ?>"
@@ -490,11 +563,14 @@ function data_table_render(array $cfg, array $dt, callable $rowRenderer)
                                         matching the typed text against this column's
                                         rendered cell content. data-dt-col-idx is the
                                         zero-based column index. */ ?>
+                                <?php $cliCur = $dt['client_filters'][$c['key']] ?? ''; ?>
                                 <div class="dt-filter-pill">
                                     <span class="dt-filter-icon" aria-hidden="true">🔍</span>
                                     <input type="text" class="dt-col-filter dt-col-filter-client"
                                            data-dt-col-client="1"
+                                           data-dt-col="<?= h($c['key']) ?>"
                                            data-dt-col-idx="<?= (int)$idx ?>"
+                                           value="<?= h($cliCur) ?>"
                                            placeholder="<?= h($c['label']) ?>">
                                 </div>
                             <?php endif; ?>

@@ -288,10 +288,23 @@ code {
 }
 .logout:hover { background: var(--sidebar-bg-hover); color: white; text-decoration: none; }
 
+.account-link {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 10px;
+    margin-bottom: 4px;
+    color: var(--sidebar-text-dim);
+    font-size: 12.5px;
+    text-decoration: none;
+    border-radius: 5px;
+    transition: background 0.12s;
+}
+.account-link:hover { background: var(--sidebar-bg-hover); color: white; text-decoration: none; }
+
 .sidebar.collapsed .sidebar-footer { padding: 10px 8px; }
 .sidebar.collapsed .user-meta { display: none; }
 .sidebar.collapsed .user-card { justify-content: center; margin-bottom: 8px; }
 .sidebar.collapsed .logout { justify-content: center; padding: 8px; }
+.sidebar.collapsed .account-link { justify-content: center; padding: 8px; }
 
 /* ============================================================
    Page header — H1 + actions on right

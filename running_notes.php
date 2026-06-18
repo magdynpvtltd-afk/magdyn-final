@@ -102,9 +102,81 @@ function running_notes_render_import_result(array $result, ?string $fatalError):
             <?php endif; ?>
 
             <div class="alert alert-info" style="margin-top:20px;">
-                Attachment <em>metadata</em> was imported. Copy the physical files into
-                <code>uploads/notes/old_import/</code> (named by their old <code>tmp_name</code> hash)
-                so the 📎 download links resolve.
+                Attachment <em>metadata</em> was imported. Now run
+                <strong>Step 2 — Download Attachment Files</strong> on the import page to fetch the
+                physical files from the old server so the 📎 download links resolve.
+            </div>
+        <?php endif; ?>
+
+            <div style="margin-top:24px;display:flex;gap:10px;">
+                <a class="btn btn-primary" href="<?= h(url('/running_notes.php?action=list')) ?>">View Running Notes</a>
+                <a class="btn btn-ghost"   href="<?= h(url('/running_notes.php?action=import')) ?>">Back to Import</a>
+            </div>
+        </div>
+    </div>
+    <?php
+    require __DIR__ . '/includes/footer.php';
+}
+
+/**
+ * Render the "download attachment files" result page (stat cards + log).
+ * Shown after a POST to ?action=import_attachments.
+ */
+function running_notes_render_attach_result(array $result, ?string $fatalError): void
+{
+    $page_title  = 'Download Attachment Files — Results';
+    $page_module = 'running_notes';
+    require __DIR__ . '/includes/header.php';
+    ?>
+    <div class="form-page">
+        <?= form_toolbar([
+            'title'      => 'Download Attachment Files — Results',
+            'back_href'  => url('/running_notes.php?action=import'),
+            'back_label' => 'Back to Import',
+        ]) ?>
+        <div class="form-page-body" style="max-width:820px;">
+        <?php if ($fatalError): ?>
+            <div class="alert alert-error">
+                <strong>Download failed with a fatal error:</strong><br>
+                <code><?= h($fatalError) ?></code>
+            </div>
+        <?php else: ?>
+            <h3 style="margin:0 0 8px;">Attachment Files</h3>
+            <div style="display:flex; gap:12px; flex-wrap:wrap; margin-bottom:24px;">
+                <?php foreach ([
+                    ['Files referenced',  $result['att_total']  ?? 0, '#f3f4f6', '#374151'],
+                    ['Downloaded',        $result['downloaded'] ?? 0, '#d1fae5', '#065f46'],
+                    ['Already present',   $result['already']    ?? 0, '#dbeafe', '#1e40af'],
+                    ['Missing on source', $result['missing']    ?? 0, '#fef9c3', '#854d0e'],
+                    ['Failed',            $result['failed']     ?? 0, '#fee2e2', '#991b1b'],
+                ] as [$label, $val, $bg, $color]): ?>
+                <div style="background:<?= $bg ?>;color:<?= $color ?>;border-radius:8px;
+                            padding:14px 24px;min-width:130px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.06);">
+                    <div style="font-size:30px;font-weight:700;line-height:1.1;"><?= number_format((int)$val) ?></div>
+                    <div style="font-size:12px;margin-top:4px;"><?= h($label) ?></div>
+                </div>
+                <?php endforeach; ?>
+            </div>
+
+            <?php if (!empty($result['errors'])): ?>
+            <h3 style="margin-bottom:8px;">Download Log</h3>
+            <div style="background:#f9fafb;border:1px solid var(--border);border-radius:6px;
+                        max-height:360px;overflow-y:auto;padding:12px;
+                        font-size:12px;font-family:monospace;line-height:1.6;">
+                <?php foreach ($result['errors'] as $entry): ?>
+                <?php $c = $entry['level'] === 'error' ? '#991b1b' : ($entry['level'] === 'warn' ? '#854d0e' : '#374151'); ?>
+                <div style="color:<?= $c ?>;margin-bottom:2px;">
+                    [<?= h($entry['time']) ?>]
+                    [<?= strtoupper(h($entry['level'])) ?>]
+                    <?= h(is_array($entry['message']) ? json_encode($entry['message']) : $entry['message']) ?>
+                </div>
+                <?php endforeach; ?>
+            </div>
+            <?php endif; ?>
+
+            <div class="alert alert-info" style="margin-top:20px;">
+                The 📎 download links on imported notes now resolve to the files fetched here.
+                You can re-run this safely — files already on disk are skipped.
             </div>
         <?php endif; ?>
 
@@ -162,6 +234,19 @@ if (notes_handle_action()) {
 // list's view gate below.
 // =================================================================
 
+// ── GET: render the stashed attachment-download result (streaming redirect) ──
+if ($_SERVER['REQUEST_METHOD'] === 'GET' && (string)input('result') === 'attachments') {
+    require_permission('running_notes', 'manage');
+    $stash = $_SESSION['imp_result_note_atts'] ?? null;
+    unset($_SESSION['imp_result_note_atts']);
+    if (!$stash) {
+        // Nothing stashed (e.g. page refreshed) — go back to the import page.
+        redirect(url('/running_notes.php?action=import'));
+    }
+    running_notes_render_attach_result($stash['result'] ?? [], $stash['fatal'] ?? null);
+    exit;
+}
+
 // ── POST: delete ALL running notes (every module) ───────────────────────────
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'delete_all_notes') {
     csrf_check();
@@ -202,6 +287,82 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'import
     exit;
 }
 
+// ── POST: download attachment files from the old server ──────────────────────
+// Fetches the physical files for every imported note attachment straight from
+// api_export_notes.php and drops them into uploads/notes/old_import/ so the
+// 📎 download links resolve. Idempotent — already-downloaded files are skipped.
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'import_attachments') {
+    csrf_check();
+    require_permission('running_notes', 'manage');
+    @set_time_limit(0);
+    @ignore_user_abort(true);
+
+    require_once __DIR__ . '/services/OldInventoryNoteAttachmentsImportService.php';
+
+    // Optional cap: download only the first N files (a test run). 0/blank = all.
+    $limit = max(0, (int) input('limit', 0));
+
+    // The download runs the same way regardless of transport; only how we report
+    // progress differs (streamed NDJSON for the live bar vs a plain result page).
+    $runner = function (callable $emit) use ($limit) {
+        $fatalError = null;
+        $result     = [];
+        try {
+            $svc = new OldInventoryNoteAttachmentsImportService((int) current_user_id());
+            $svc->setProgressCallback($emit);
+            $svc->setLimit($limit);
+            $result = $svc->run();
+        } catch (Throwable $e) {
+            $fatalError = $e->getMessage();
+        }
+        return [$result, $fatalError];
+    };
+
+    // ── Streaming path (progressive enhancement): emit NDJSON progress events
+    //    so the browser can draw a live bar. Flushing each event also keeps the
+    //    connection active, so a multi-minute download never hits an idle timeout.
+    if ((string) input('stream') === '1') {
+        @ini_set('zlib.output_compression', '0');
+        @ini_set('output_buffering', '0');
+        if (function_exists('apache_setenv')) {
+            @apache_setenv('no-gzip', '1');
+            @apache_setenv('dont-vary', '1');
+        }
+        while (ob_get_level() > 0) { @ob_end_flush(); }
+        header('Content-Type: application/x-ndjson; charset=utf-8');
+        header('Content-Encoding: none');
+        header('Cache-Control: no-cache, no-store');
+        header('X-Accel-Buffering: no');
+
+        $send = function (array $msg) {
+            echo json_encode($msg) . "\n";
+            @ob_flush();
+            @flush();
+        };
+        $emit = function (string $phase, int $done, int $total) use ($send) {
+            $pct = $total > 0 ? (int) floor($done * 100 / $total) : 100;
+            $send(['type' => 'progress', 'phase' => $phase, 'done' => $done, 'total' => $total, 'percent' => $pct]);
+        };
+
+        $send(['type' => 'start']);
+        [$result, $fatalError] = $runner($emit);
+
+        // Stash the result for the redirect GET, then release the session lock
+        // before telling the browser to navigate (so the result page isn't blocked).
+        $_SESSION['imp_result_note_atts'] = ['result' => $result, 'fatal' => $fatalError];
+        if (session_status() === PHP_SESSION_ACTIVE) {
+            session_write_close();
+        }
+        $send(['type' => 'done', 'redirect' => url('/running_notes.php?result=attachments'), 'fatal' => $fatalError]);
+        exit;
+    }
+
+    // ── No-JS fallback: run synchronously and render the result page directly.
+    [$result, $fatalError] = $runner(function () {});
+    running_notes_render_attach_result($result, $fatalError);
+    exit;
+}
+
 // ── GET: import confirmation / status page ───────────────────────────────────
 if ($action === 'import') {
     require_permission('running_notes', 'manage');
@@ -210,16 +371,29 @@ if ($action === 'import') {
     // renders the page (delete-all works without it).
     $apiError    = null;
     $sourceCount = 0;
+    $sourceAtts  = null;   // null = couldn't fetch (older API without the endpoint)
     try {
         require_once __DIR__ . '/includes/old_inventory_api.php';
         old_inventory_notes_api('ping');
         $sourceCount = (int) (old_inventory_notes_api('notes_count')['count'] ?? 0);
+        try {
+            $sourceAtts = (int) (old_inventory_notes_api('attachments_count')['count'] ?? 0);
+        } catch (Throwable $e) {
+            $sourceAtts = null;   // endpoint not deployed yet — non-fatal
+        }
     } catch (Throwable $e) {
         $apiError = $e->getMessage();
     }
 
     $localNotes = (int) db_val('SELECT COUNT(*) FROM notes', [], 0);
     $localAtts  = (int) db_val('SELECT COUNT(*) FROM note_attachments', [], 0);
+
+    // Source URL shown under the Step 2 button (best-effort).
+    $notesUrl = '';
+    try {
+        $cfg      = require __DIR__ . '/config/old_inventory_api.php';
+        $notesUrl = (string) ($cfg['notes_url'] ?? '');
+    } catch (Throwable $e) { /* leave blank */ }
 
     $page_title  = 'Import Running Notes';
     $page_module = 'running_notes';
@@ -233,6 +407,21 @@ if ($action === 'import') {
             'back_label' => 'Back to Running Notes',
         ]) ?>
         <div class="form-page-body" style="max-width:720px;">
+
+            <!-- Live progress panel (revealed by JS while the attachment download streams) -->
+            <div id="import-progress" style="display:none;background:#f8fafc;border:1px solid var(--border);
+                 border-radius:10px;padding:18px 20px;margin-bottom:24px;box-shadow:0 1px 3px rgba(0,0,0,.06);">
+                <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;">
+                    <h3 id="ip-title" style="margin:0;">Downloading…</h3>
+                    <span id="ip-pct" style="font-weight:700;font-variant-numeric:tabular-nums;">0%</span>
+                </div>
+                <div id="ip-phase" class="muted small" style="margin:6px 0 10px;">Starting…</div>
+                <div style="background:#e5e7eb;border-radius:999px;height:16px;overflow:hidden;">
+                    <div id="ip-bar" style="background:#2563eb;height:100%;width:0%;border-radius:999px;
+                         transition:width .25s ease;"></div>
+                </div>
+                <div class="muted small" style="margin-top:8px;">Please keep this page open until the download finishes.</div>
+            </div>
 
             <?php if ($apiError): ?>
             <div class="alert alert-error" style="margin-bottom:20px;">
@@ -265,7 +454,7 @@ if ($action === 'import') {
                     </tr>
                     <tr>
                         <td>Attachments</td>
-                        <td style="text-align:right;font-weight:600;">—</td>
+                        <td style="text-align:right;font-weight:600;"><?= $sourceAtts === null ? '—' : number_format($sourceAtts) ?></td>
                         <td style="text-align:right;"><?= number_format($localAtts) ?></td>
                     </tr>
                 </tbody>
@@ -277,7 +466,7 @@ if ($action === 'import') {
                 <tr><th>Class <code>P</code></th><td>Linked to the <strong>inventory item</strong> whose <em>Inventory Code</em> (<code>code</code>) equals the old <code>inv_notes.id</code>.</td></tr>
                 <tr><th>With a <code>tid</code></th><td>Linked to the specific <strong>inventory transaction</strong> (matched via <code>OLD-ITX-&lt;tid&gt;</code>). Falls back to the class entity if the txn isn't found.</td></tr>
                 <tr><th>Note type</th><td>Taken from the old <code>priority</code> column (e.g. <em>Dimension</em>, <em>General</em>) and shown in the <strong>Category</strong> column. New categories are <strong>created automatically</strong> if they don't exist yet.</td></tr>
-                <tr><th>Attachments</th><td>Metadata only. <code>stored_path = old_import/&lt;tmp_name&gt;</code> — copy the physical files into <code>uploads/notes/old_import/</code> separately.</td></tr>
+                <tr><th>Attachments</th><td>This step imports attachment <strong>metadata</strong> only. Run <strong>Step 2 — Download Attachment Files</strong> below to fetch the physical files from the old server.</td></tr>
                 <tr><th>Author / date</th><td>Authored by you; original <code>created_date</code> preserved.</td></tr>
             </table>
 
@@ -308,8 +497,8 @@ if ($action === 'import') {
             </div>
 
             <?php if (!$apiError): ?>
-            <!-- Run import -->
-            <h3 style="margin:0 0 10px;">Run Import</h3>
+            <!-- Step 1 — import note rows + attachment metadata via API -->
+            <h3 style="margin:0 0 10px;">Step 1 — Import Notes (via API)</h3>
             <form method="post" action="<?= h(url('/running_notes.php')) ?>"
                   onsubmit="return confirm('Import all running notes from the old system?\n\nRun \'Delete All Running Notes\' first if you want a clean re-import.');">
                 <?= csrf_field() ?>
@@ -320,10 +509,157 @@ if ($action === 'import') {
                     <span class="muted small">This may take up to a minute.</span>
                 </div>
             </form>
+
+            <!-- Step 2 — download the physical attachment files from the old server -->
+            <h3 style="margin:28px 0 10px;">Step 2 — Download Attachment Files</h3>
+            <p class="muted small" style="margin:0 0 12px;">
+                Fetches the physical files for the <strong><?= number_format($localAtts) ?></strong>
+                imported attachment<?= $localAtts === 1 ? '' : 's' ?> straight from the old server
+                (<code>api_export_notes.php</code>) into <code>uploads/notes/old_import/</code>, so the
+                📎 download links resolve. Run <strong>Step 1</strong> first.
+                This step is <strong>idempotent</strong> — files already downloaded are skipped, so it is
+                safe to re-run if it is interrupted. With <?= number_format($localAtts) ?> files this can
+                take several minutes; keep this tab open until it finishes.
+            </p>
+            <form method="post" action="<?= h(url('/running_notes.php')) ?>"
+                  class="js-stream-import" data-title="Downloading attachment files"
+                  data-confirm="Download all attachment files from the old server?&#10;&#10;Import the notes (Step 1) first.">
+                <?= csrf_field() ?>
+                <input type="hidden" name="action" value="import_attachments">
+                <div style="display:flex;gap:10px;align-items:center;">
+                    <button type="submit" class="btn btn-primary" <?= $localAtts === 0 ? 'disabled title="No imported attachments yet — run Step 1 first."' : '' ?>>
+                        ⬇ Download All Attachment Files
+                    </button>
+                    <span class="muted small">Downloads from <?= h($notesUrl) ?></span>
+                </div>
+            </form>
+
+            <!-- Test run: download only the first N files -->
+            <form method="post" action="<?= h(url('/running_notes.php')) ?>"
+                  class="js-stream-import" data-title="Downloading attachment files"
+                  style="margin-top:12px;">
+                <?= csrf_field() ?>
+                <input type="hidden" name="action" value="import_attachments">
+                <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                    <label class="muted small" for="limit_n">Download only the first</label>
+                    <input type="number" id="limit_n" name="limit" min="1" max="<?= (int)$localAtts ?>"
+                           value="10" style="width:90px;" required
+                           <?= $localAtts === 0 ? 'disabled' : '' ?>>
+                    <label class="muted small" for="limit_n">files (a quick test run)</label>
+                    <button type="submit" class="btn btn-ghost" <?= $localAtts === 0 ? 'disabled title="No imported attachments yet — run Step 1 first."' : '' ?>>
+                        ⬇ Download N
+                    </button>
+                </div>
+            </form>
             <?php endif; ?>
 
         </div>
     </div>
+
+    <script>
+    // Progressive enhancement: stream the attachment download into the panel above.
+    // The Step 2 form (.js-stream-import) POSTs with stream=1 and draws a live bar
+    // from the NDJSON the server emits. Without JS it submits normally and falls
+    // back to the synchronous "run then show results" page.
+    (function () {
+        var panel = document.getElementById('import-progress');
+        if (!panel || !window.fetch || !window.ReadableStream) return;
+
+        var bar   = document.getElementById('ip-bar');
+        var pct   = document.getElementById('ip-pct');
+        var phase = document.getElementById('ip-phase');
+        var title = document.getElementById('ip-title');
+
+        function show(t) {
+            title.textContent = t;
+            phase.textContent = 'Starting…';
+            bar.style.width = '0%';
+            bar.style.background = '#2563eb';
+            pct.textContent = '0%';
+            panel.style.display = 'block';
+            panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+        function num(n) { try { return Number(n).toLocaleString(); } catch (e) { return n; } }
+        function setProgress(ph, done, total, percent) {
+            phase.textContent = ph + ' — ' + num(done) + ' / ' + num(total);
+            bar.style.width = percent + '%';
+            pct.textContent = percent + '%';
+        }
+        function fail(msg) {
+            bar.style.background = '#dc2626';
+            phase.textContent = 'Download failed: ' + msg;
+        }
+
+        function handleLine(line) {
+            var msg;
+            try { msg = JSON.parse(line); } catch (e) { return; }
+            if (msg.type === 'progress') {
+                setProgress(msg.phase, msg.done, msg.total, msg.percent);
+            } else if (msg.type === 'done') {
+                if (msg.fatal) { fail(msg.fatal); return; }
+                phase.textContent = 'Finishing…';
+                bar.style.width = '100%';
+                pct.textContent = '100%';
+                window.location = msg.redirect;
+            }
+        }
+
+        Array.prototype.forEach.call(document.querySelectorAll('form.js-stream-import'), function (form) {
+            form.addEventListener('submit', function (ev) {
+                ev.preventDefault();
+
+                var confirmMsg = form.getAttribute('data-confirm');
+                if (confirmMsg && !window.confirm(confirmMsg)) return;
+
+                Array.prototype.forEach.call(form.querySelectorAll('button[type=submit]'), function (b) {
+                    b.disabled = true;
+                });
+                show(form.getAttribute('data-title') || 'Downloading…');
+
+                var fd = new FormData(form);
+                fd.set('stream', '1');
+
+                // Use getAttribute('action'), NOT form.action — the hidden
+                // <input name="action"> shadows the form's .action property.
+                var actionUrl = form.getAttribute('action');
+
+                fetch(actionUrl, {
+                    method: 'POST',
+                    body: fd,
+                    headers: { 'X-Requested-With': 'fetch' },
+                    credentials: 'same-origin'
+                }).then(function (resp) {
+                    if (!resp.ok || !resp.body) { throw new Error('HTTP ' + resp.status); }
+                    var reader = resp.body.getReader();
+                    var dec = new TextDecoder();
+                    var buf = '';
+                    function pump() {
+                        return reader.read().then(function (r) {
+                            if (r.done) {
+                                if (buf.trim() !== '') handleLine(buf.trim());
+                                return;
+                            }
+                            buf += dec.decode(r.value, { stream: true });
+                            var idx;
+                            while ((idx = buf.indexOf('\n')) >= 0) {
+                                var line = buf.slice(0, idx);
+                                buf = buf.slice(idx + 1);
+                                if (line.trim() !== '') handleLine(line);
+                            }
+                            return pump();
+                        });
+                    }
+                    return pump();
+                }).catch(function (err) {
+                    fail(String(err && err.message ? err.message : err));
+                    Array.prototype.forEach.call(form.querySelectorAll('button[type=submit]'), function (b) {
+                        b.disabled = false;
+                    });
+                });
+            });
+        });
+    })();
+    </script>
     <?php
     require __DIR__ . '/includes/footer.php';
     exit;
@@ -1098,7 +1434,8 @@ if (permission_check('running_notes', 'create')) {
     $listActions .= '<a class="btn btn-primary btn-sm" href="' . h(url('/running_notes.php?action=new')) . '"'
         . ' data-shortcut="N" accesskey="n">' . shortcut_label('+ Add note', 'N') . '</a> ';
 }
-if (permission_check('running_notes', 'manage')) {
+// Old-inventory import is admin-only and lives under Admin ▸ Old Inventory Import.
+if (is_admin()) {
     $listActions .= '<a class="btn btn-ghost btn-sm" href="' . h(url('/running_notes.php?action=import')) . '">'
         . '⬇ Import from Old Inventory</a>';
 }

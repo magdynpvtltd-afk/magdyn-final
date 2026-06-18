@@ -71,7 +71,7 @@ if (!$canViewItems && !$canViewBoms) {
 // ============================================================
 $itemActions = [
     'items', 'item_new', 'item_edit', 'item_save', 'item_delete',
-    'item_clone', 'item_toggle_active',
+    'item_clone', 'item_toggle_active', 'item_billing_push',
     'item_import_preview', 'item_import_commit',
 ];
 $txnActions = [
@@ -84,6 +84,7 @@ $bomLineActions = [
     'bom_import_preview', 'bom_import_commit',
     'bom_old_import', 'bom_old_import_commit', 'bom_old_import_commit_batch',
     'bom_delete_preview', 'bom_delete_commit',
+    'receipt_verify_preview', 'receipt_verify_commit',
 ];
 $bomViewActions = [
     'boms', 'bom_view', 'bom_edit', 'bom_grid',

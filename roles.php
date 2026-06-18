@@ -175,57 +175,182 @@ if ($action === 'new' || $action === 'edit') {
                 <p class="muted small">Tick the permissions this role should grant. Use the column header to toggle a whole module.</p>
 
                 <?php
-                // Split the matrix: regular modules render in the main
-                // table; note_cat_* modules go into a separate collapsible
-                // section so the page stays clean as note categories grow.
-                // Skip inactive note_cat_* modules — those correspond to
-                // disabled categories and shouldn't be grant-able.
-                $regularMods   = [];
+                // ----------------------------------------------------------
+                // Group the permission matrix to mirror the sidebar nav.
+                //
+                // Every permission card maps to a TOP-LEVEL nav group (Assets,
+                // Inventory, Reports, Admin, ...). Sub-modules that live under
+                // a group in the nav (View Assets, View Models, Asset
+                // Transactions, ...) render as labelled subsections inside
+                // their parent group's card instead of as loose cards.
+                //
+                // The hierarchy comes from modules.parent_id / is_group, the
+                // same columns visible_module_tree() uses for the sidebar — so
+                // the section titles match the nav tabs exactly.
+                //
+                // note_cat_* modules have no nav group; they stay in their own
+                // collapsible section below. Inactive ones are skipped.
+                // ----------------------------------------------------------
+                $byId          = [];
+                $childrenOf    = [];
                 $noteCatMods   = [];
                 foreach ($matrix as $m) {
-                    if (strpos($m['code'], 'note_cat_') === 0) {
-                        if ((int)$m['is_active'] !== 1) continue;
-                        $noteCatMods[] = $m;
-                    } else {
-                        $regularMods[] = $m;
+                    $byId[(int)$m['id']] = $m;
+                    if (!empty($m['parent_id'])) {
+                        $childrenOf[(int)$m['parent_id']][] = $m;
                     }
                 }
+
+                // Flatten a module's descendants depth-first, preserving the
+                // matrix (sort_order) ordering. Sub-groups (e.g. Tools →
+                // Weight Calculator) are flattened in too.
+                $collectDesc = function ($pid) use (&$collectDesc, $childrenOf) {
+                    $out = [];
+                    foreach ($childrenOf[$pid] ?? [] as $c) {
+                        $out[] = $c;
+                        foreach ($collectDesc((int)$c['id']) as $d) { $out[] = $d; }
+                    }
+                    return $out;
+                };
+
+                // Top-level entries = modules with no parent. Render groups and
+                // standalone modules (Dashboard); peel note categories off.
+                $topRows = [];
+                foreach ($matrix as $m) {
+                    if (!empty($m['parent_id'])) continue;
+                    if (strpos($m['code'], 'note_cat_') === 0) {
+                        if ((int)$m['is_active'] === 1) $noteCatMods[] = $m;
+                        continue;
+                    }
+                    $topRows[] = $m;
+                }
+
+                // ---- Redundancy filters (keep the editor showing only the
+                //      permissions that actually DO something) ----
+                //
+                // 1) Nav-wrapper sub-modules: pure menu-link toggles whose
+                //    page is gated by a PARENT permission, not their own (the
+                //    destination page checks e.g. invoice.view, never
+                //    invoice_view.view). They now appear automatically via the
+                //    $navInherit map in visible_modules(), so granting them
+                //    here is redundant. Hide them.
+                $navWrapperCodes = [
+                    'asset_view_assets', 'asset_view_models', 'asset_transactions',
+                    'invoice_view', 'invoice_new',
+                    'insp_new', 'insp_completed', 'insp_templates',
+                    'tools_bubble', 'tools_cad', 'tools_weight', 'tools_calc',
+                    'inventory_shipments_list',
+                ];
+
+                // 2) Dead permissions: defined in the DB but never enforced by
+                //    any require_permission()/permission_check() call. The
+                //    "inventory"/"reports" GROUP rows are nav-only (their real
+                //    perms live on sub-modules), and tools.manage is unused.
+                $deadPerms = [
+                    'inventory.view', 'inventory.manage',
+                    'reports.view', 'reports.manage',
+                    'tools.manage',
+                    'manuals.view',        // manuals.php has no permission gate
+                    'job_card.close',      // never enforced (close is a workflow step, not a perm)
+                ];
+
+                // Drop dead permissions from a module's permission list.
+                $livePerms = function ($modCode, $perms) use ($deadPerms) {
+                    $out = [];
+                    foreach ($perms as $p) {
+                        if (in_array($modCode . '.' . $p['code'], $deadPerms, true)) continue;
+                        $out[] = $p;
+                    }
+                    return $out;
+                };
+
+                // Build a render model per top-level group:
+                //   selfPerms  — permissions on the group module itself
+                //   subs       — [['name'=>..., 'id'=>..., 'perms'=>[...]], ...]
+                //   total      — total permission count in the card
+                $cards = [];
+                foreach ($topRows as $g) {
+                    if ((int)$g['is_active'] !== 1) continue;   // skip disabled groups
+                    $selfPerms = $livePerms($g['code'], $g['permissions']);
+                    $subs  = [];
+                    $total = count($selfPerms);
+                    foreach ($collectDesc((int)$g['id']) as $child) {
+                        if ((int)$child['is_active'] !== 1) continue;          // skip disabled modules
+                        if (in_array($child['code'], $navWrapperCodes, true)) continue;  // nav-only wrapper
+                        $childPerms = $livePerms($child['code'], $child['permissions']);
+                        if (!$childPerms) continue;
+                        $subs[] = [
+                            'id'    => (int)$child['id'],
+                            'name'  => $child['name'],
+                            'perms' => $childPerms,
+                        ];
+                        $total += count($childPerms);
+                    }
+                    if ($total === 0) continue;   // nothing grantable — skip
+                    $cards[] = [
+                        'row'       => $g,
+                        'selfPerms' => $selfPerms,
+                        'subs'      => $subs,
+                        'total'     => $total,
+                    ];
+                }
+
+                $permOption = function ($p, $modId, $grpId, &$tabIdx, $rolePerms, $showCode = true) {
+                    $checked = in_array($p['id'], $rolePerms) ? 'checked' : '';
+                    ob_start(); ?>
+                    <label class="perm-option">
+                        <input type="checkbox" name="perms[]" value="<?= (int)$p['id'] ?>"
+                               class="mod-<?= $modId ?> grp-<?= $grpId ?>"
+                               tabindex="<?= $tabIdx++ ?>" <?= $checked ?>>
+                        <span class="perm-option-text">
+                            <span class="perm-option-name"><?= h($p['name']) ?></span>
+                            <?php if ($showCode): ?><span class="perm-option-code"><?= h($p['code']) ?></span><?php endif; ?>
+                        </span>
+                    </label>
+                    <?php return ob_get_clean();
+                };
                 ?>
 
-                <table class="data-table perm-matrix" style="margin-top: 12px;">
-                    <thead>
-                    <tr>
-                        <th>Module</th>
-                        <th>Permissions</th>
-                    </tr>
-                    </thead>
-                    <tbody>
-                    <?php $tabIdx = 4; foreach ($regularMods as $m): ?>
-                        <tr>
-                            <th>
-                                <label class="nowrap">
+                <div class="perm-modules">
+                    <?php $tabIdx = 4; foreach ($cards as $card):
+                        $g     = $card['row'];
+                        $grpId = (int)$g['id'];
+                    ?>
+                        <section class="perm-module">
+                            <div class="perm-module-head">
+                                <label class="perm-module-title nowrap">
                                     <input type="checkbox" class="mod-toggle"
-                                           data-target="mod-<?= (int)$m['id'] ?>"
+                                           data-target="grp-<?= $grpId ?>"
                                            tabindex="<?= $tabIdx++ ?>">
-                                    <?= h(module_icon($m['code'], $m['icon'])) ?> <?= h($m['name']) ?>
+                                    <span class="perm-module-icon"><?= h(module_icon($g['code'], $g['icon'])) ?></span>
+                                    <span><?= h($g['name']) ?></span>
                                 </label>
-                            </th>
-                            <td style="text-align: left;">
-                                <?php foreach ($m['permissions'] as $p): ?>
-                                    <label class="nowrap" style="margin-right: 16px; font-weight: normal;">
-                                        <input type="checkbox" name="perms[]" value="<?= (int)$p['id'] ?>"
-                                               class="mod-<?= (int)$m['id'] ?>"
-                                               tabindex="<?= $tabIdx++ ?>"
-                                               <?= in_array($p['id'], $rolePerms) ? 'checked' : '' ?>>
-                                        <?= h($p['name']) ?>
-                                        <code class="muted"><?= h($p['code']) ?></code>
-                                    </label>
+                                <span class="perm-module-count"><?= (int)$card['total'] ?></span>
+                            </div>
+                            <div class="perm-module-body">
+                                <?php // Group's own permissions (no sub-label).
+                                foreach ($card['selfPerms'] as $p) {
+                                    echo $permOption($p, $grpId, $grpId, $tabIdx, $rolePerms);
+                                } ?>
+
+                                <?php // Each sub-module as its own labelled block.
+                                foreach ($card['subs'] as $sub): ?>
+                                    <div class="perm-subgroup">
+                                        <label class="perm-subgroup-head nowrap">
+                                            <input type="checkbox" class="mod-toggle"
+                                                   data-target="mod-<?= $sub['id'] ?>"
+                                                   tabindex="<?= $tabIdx++ ?>">
+                                            <span><?= h($sub['name']) ?></span>
+                                        </label>
+                                        <?php foreach ($sub['perms'] as $p) {
+                                            echo $permOption($p, $sub['id'], $grpId, $tabIdx, $rolePerms);
+                                        } ?>
+                                    </div>
                                 <?php endforeach; ?>
-                            </td>
-                        </tr>
+                            </div>
+                        </section>
                     <?php endforeach; ?>
-                    </tbody>
-                </table>
+                </div>
 
                 <?php if ($noteCatMods): ?>
                     <details class="perm-matrix-group" style="margin-top: 16px;">
@@ -235,44 +360,39 @@ if ($action === 'new' || $action === 'edit') {
                                 (<?= count($noteCatMods) ?> categor<?= count($noteCatMods) === 1 ? 'y' : 'ies' ?> — controls who can view/post notes per category)
                             </span>
                         </summary>
-                        <table class="data-table perm-matrix" style="margin-top: 8px;">
-                            <thead>
-                            <tr>
-                                <th>Category</th>
-                                <th>Permissions</th>
-                            </tr>
-                            </thead>
-                            <tbody>
+                        <div class="perm-modules">
                             <?php foreach ($noteCatMods as $m):
                                 // Strip the "Note category: " prefix from the
                                 // display since the section header already
                                 // explains the context.
                                 $displayName = preg_replace('/^Note category:\s*/', '', $m['name']);
                             ?>
-                                <tr>
-                                    <th>
-                                        <label class="nowrap">
+                                <section class="perm-module">
+                                    <div class="perm-module-head">
+                                        <label class="perm-module-title nowrap">
                                             <input type="checkbox" class="mod-toggle"
                                                    data-target="mod-<?= (int)$m['id'] ?>"
                                                    tabindex="<?= $tabIdx++ ?>">
-                                            <?= h($displayName) ?>
+                                            <span><?= h($displayName) ?></span>
                                         </label>
-                                    </th>
-                                    <td style="text-align: left;">
+                                        <span class="perm-module-count"><?= count($m['permissions']) ?></span>
+                                    </div>
+                                    <div class="perm-module-body">
                                         <?php foreach ($m['permissions'] as $p): ?>
-                                            <label class="nowrap" style="margin-right: 16px; font-weight: normal;">
+                                            <label class="perm-option">
                                                 <input type="checkbox" name="perms[]" value="<?= (int)$p['id'] ?>"
                                                        class="mod-<?= (int)$m['id'] ?>"
                                                        tabindex="<?= $tabIdx++ ?>"
                                                        <?= in_array($p['id'], $rolePerms) ? 'checked' : '' ?>>
-                                                <?= h(ucfirst($p['code'])) ?>
+                                                <span class="perm-option-text">
+                                                    <span class="perm-option-name"><?= h(ucfirst($p['code'])) ?></span>
+                                                </span>
                                             </label>
                                         <?php endforeach; ?>
-                                    </td>
-                                </tr>
+                                    </div>
+                                </section>
                             <?php endforeach; ?>
-                            </tbody>
-                        </table>
+                        </div>
                     </details>
                 <?php endif; ?>
             </div>
@@ -280,16 +400,35 @@ if ($action === 'new' || $action === 'edit') {
     </div>
 
     <script>
-    // Whole-module toggle (column header checkbox toggles every child checkbox)
-    document.querySelectorAll('.mod-toggle').forEach(function (cb) {
-        var children = document.querySelectorAll('.' + cb.getAttribute('data-target'));
-        // Initialise: if all children are checked, check the master
-        var allChecked = Array.prototype.every.call(children, function (c) { return c.checked; });
-        cb.checked = allChecked && children.length > 0;
+    // Toggles work at two levels:
+    //   • group master  (data-target="grp-<id>")  → every checkbox in the card
+    //   • sub-module     (data-target="mod-<id>")  → that sub-module's boxes
+    // A master reflects its children: checked when all are on, indeterminate
+    // when only some are. Ticking any leaf refreshes every master above it.
+    var masters = Array.prototype.slice.call(document.querySelectorAll('.mod-toggle'));
+
+    function childrenOf(cb) {
+        return document.querySelectorAll('.' + cb.getAttribute('data-target'));
+    }
+    function refreshMasters() {
+        masters.forEach(function (cb) {
+            var children = childrenOf(cb);
+            var on = 0;
+            Array.prototype.forEach.call(children, function (c) { if (c.checked) on++; });
+            cb.checked = children.length > 0 && on === children.length;
+            cb.indeterminate = on > 0 && on < children.length;
+        });
+    }
+    masters.forEach(function (cb) {
         cb.addEventListener('change', function () {
-            children.forEach(function (c) { c.checked = cb.checked; });
+            Array.prototype.forEach.call(childrenOf(cb), function (c) { c.checked = cb.checked; });
+            refreshMasters();
         });
     });
+    document.querySelectorAll('input[name="perms[]"]').forEach(function (c) {
+        c.addEventListener('change', refreshMasters);
+    });
+    refreshMasters();
     </script>
     <?php require __DIR__ . '/includes/footer.php';
     exit;

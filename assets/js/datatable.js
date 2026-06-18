@@ -19,6 +19,9 @@
     'use strict';
 
     var DEBOUNCE_MS = 250;
+    // Endpoint that persists per-user view state (filters/search/sort/size).
+    // Same handler as the column-prefs panel, different op.
+    var PREFS_ENDPOINT = (window.MAGDYN_BASE || '').replace(/\/+$/, '') + '/api/dt_prefs.php';
 
     function debounce(fn, ms) {
         var t;
@@ -50,6 +53,38 @@
             if (inp.value) state.col[k] = inp.value;
         });
         return state;
+    }
+
+    // Build the persistable view-state blob: global search, page size,
+    // sort, server-side per-column filters, AND client-side (DOM-only)
+    // filters. The page number is deliberately omitted — a restored view
+    // always lands on page 1.
+    function buildViewState(wrap) {
+        var s = readState(wrap);
+        var client = {};
+        wrap.querySelectorAll('.dt-col-filter-client').forEach(function (inp) {
+            var k = inp.getAttribute('data-dt-col');
+            var v = (inp.value || '').trim();
+            if (k && v) client[k] = v;
+        });
+        return { q: s.q, size: s.size, sort: s.sort, dir: s.dir, col: s.col, client: client };
+    }
+
+    // Persist the current view-state for this table to the server, keyed by
+    // the logged-in user + the table id. Silent best-effort: a failure just
+    // means the view isn't remembered next visit. Gated on data-dt-savestate
+    // so pages can opt out ($cfg['save_state'] = false).
+    function saveView(wrap) {
+        if (wrap.getAttribute('data-dt-savestate') !== '1') return;
+        var dtId = wrap.getAttribute('data-dt-id');
+        var csrf = wrap.getAttribute('data-dt-csrf') || '';
+        if (!dtId || !csrf) return;
+        fetch(PREFS_ENDPOINT + '?op=save_view', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+            body: JSON.stringify({ dt_id: dtId, state: buildViewState(wrap) })
+        }).catch(function () { /* best-effort */ });
     }
 
     // Immediately refresh the "Showing X to Y of Z" summary from known values.
@@ -192,14 +227,19 @@
             reload(wrap, s, push !== false);
         }, DEBOUNCE_MS);
 
+        // Debounced persistence of the view-state. Slightly slower than the
+        // reload debounce so typing settles before we write.
+        var debouncedSave = debounce(function () { saveView(wrap); }, 500);
+
         // ---- Global search box ----
         var qInput = wrap.querySelector('.dt-q');
         if (qInput) {
             qInput.addEventListener('input', function () {
                 debouncedReload(true);
+                debouncedSave();
             });
             qInput.addEventListener('keydown', function (e) {
-                if (e.key === 'Escape') { qInput.value = ''; debouncedReload(true); }
+                if (e.key === 'Escape') { qInput.value = ''; debouncedReload(true); debouncedSave(); }
             });
         }
 
@@ -213,6 +253,7 @@
             if (isClient) {
                 inp.addEventListener('input', function () {
                     applyClientFilters(wrap);
+                    debouncedSave();
                 });
                 return;
             }
@@ -221,11 +262,17 @@
                     var s = readState(wrap);
                     s.page = 1;
                     reload(wrap, s, true);
+                    debouncedSave();
                 });
             } else {
-                inp.addEventListener('input', function () { debouncedReload(true); });
+                inp.addEventListener('input', function () { debouncedReload(true); debouncedSave(); });
             }
         });
+
+        // Apply any restored client-side filters once on load. The server
+        // pre-populates these inputs' values from the saved view; this hides
+        // the non-matching rows so the initial paint matches the saved state.
+        applyClientFilters(wrap);
 
         // ---- Page size ----
         var sizeSel = wrap.querySelector('.dt-size');
@@ -235,6 +282,7 @@
                 s.page = 1;
                 updateRangeSummary(wrap, 1, s.size);
                 reload(wrap, s, true);
+                debouncedSave();
             });
         }
 
@@ -248,6 +296,7 @@
                 s.dir  = nextDir;
                 s.page = 1;
                 reload(wrap, s, true);
+                debouncedSave();
             }
             th.addEventListener('click', fire);
             th.addEventListener('keydown', function (e) {
@@ -275,7 +324,9 @@
         if (resizable) {
             var wrapId = wrap.getAttribute('data-dt-id') || 'default';
             var hasSaved = false;
-            // Apply previously saved widths from localStorage
+            // Apply previously saved widths. localStorage wins (it holds the
+            // freshest edit in this browser); otherwise we honor any width the
+            // server already rendered inline from the user's saved prefs.
             resizable.querySelectorAll('th[data-dt-colkey]').forEach(function (th) {
                 var key = th.getAttribute('data-dt-colkey');
                 var storageKey = 'magdyn.dt.colw.' + wrapId + '.' + key;
@@ -283,6 +334,10 @@
                 try { saved = localStorage.getItem(storageKey); } catch (e) {}
                 if (saved && /^\d+$/.test(saved)) {
                     th.style.width = saved + 'px';
+                    hasSaved = true;
+                } else if (th.style.width) {
+                    // Server-rendered width from user_dt_prefs — already on the
+                    // element; just flag it so fixed-layout + width pin kick in.
                     hasSaved = true;
                 }
             });
@@ -373,10 +428,26 @@
                         // still get session-local width preservation.
                         if (!key) return;
                         var widthPx = Math.round(th.getBoundingClientRect().width);
+                        // ALWAYS cache locally first. The load-time apply path
+                        // reads localStorage, so this is what makes the width
+                        // survive a reload in this browser regardless of whether
+                        // the server save below succeeds. (Previously this only
+                        // ran in a fetch .catch(), which never fired — fetch does
+                        // not reject on HTTP errors — so widths were lost.)
+                        try {
+                            localStorage.setItem(
+                                'magdyn.dt.colw.' + wrapId + '.' + key,
+                                String(widthPx)
+                            );
+                        } catch (e) {}
+                        // Also persist to the server when prefs are enabled, so
+                        // the width is per-user and survives across browsers /
+                        // a localStorage clear. Best-effort: the localStorage
+                        // cache above already guarantees same-browser restore.
                         var prefsEnabled = wrap.getAttribute('data-dt-prefs') === '1';
                         var csrf = wrap.getAttribute('data-dt-csrf') || '';
                         if (prefsEnabled && csrf) {
-                            fetch('/erp/api/dt_prefs.php?op=save_width', {
+                            fetch(PREFS_ENDPOINT + '?op=save_width', {
                                 method: 'POST',
                                 credentials: 'same-origin',
                                 headers: {
@@ -388,26 +459,7 @@
                                     column_key: key,
                                     width_px: widthPx
                                 })
-                            }).catch(function () {
-                                // Network/server failure: degrade to
-                                // localStorage so the width still survives
-                                // a reload within this browser.
-                                try {
-                                    localStorage.setItem(
-                                        'magdyn.dt.colw.' + wrapId + '.' + key,
-                                        String(widthPx)
-                                    );
-                                } catch (e) {}
-                            });
-                        } else {
-                            // Prefs disabled on this datatable; keep the
-                            // previous localStorage-only behaviour.
-                            try {
-                                localStorage.setItem(
-                                    'magdyn.dt.colw.' + wrapId + '.' + key,
-                                    String(widthPx)
-                                );
-                            } catch (e) {}
+                            }).catch(function () { /* localStorage already has it */ });
                         }
                     }
                     document.addEventListener('mousemove', onMove);
@@ -672,7 +724,21 @@
         foot.querySelector('[data-act="reset"]').addEventListener('click', function () {
             if (!confirm('Reset column layout to defaults for this table? (Width, order, and visibility prefs will be cleared.)')) return;
             postJson(ENDPOINT + '?op=reset', { dt_id: dtId }, csrf)
-                .then(function () { window.location.reload(); })
+                .then(function () {
+                    // Also clear the locally-cached widths for this table, or
+                    // they'd be re-applied on reload and the reset would look
+                    // like it did nothing to the column widths.
+                    try {
+                        var prefix = 'magdyn.dt.colw.' + dtId + '.';
+                        var kill = [];
+                        for (var i = 0; i < localStorage.length; i++) {
+                            var k = localStorage.key(i);
+                            if (k && k.indexOf(prefix) === 0) kill.push(k);
+                        }
+                        kill.forEach(function (k) { localStorage.removeItem(k); });
+                    } catch (e) {}
+                    window.location.reload();
+                })
                 .catch(function (err) {
                     alert('Could not reset column preferences: ' + (err && err.message || err));
                 });

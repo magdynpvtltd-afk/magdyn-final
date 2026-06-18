@@ -204,6 +204,7 @@ function bom_collect_json($id, $con, &$items, &$edges, &$eseen, &$gout, $path)
             'dwg_no'           => isset($row['cfv_26'])            ? (string)$row['cfv_26']            : '',
             'rev_no'           => isset($row['cfv_27'])            ? (string)$row['cfv_27']            : '',
             'part_no'          => isset($row['cfv_28'])            ? (string)$row['cfv_28']            : '',
+            'part_rev_no'      => isset($row['cfv_44'])            ? (string)$row['cfv_44']            : '',
             'process_spec'     => isset($row['cfv_29'])            ? (string)$row['cfv_29']            : '',
             'material_spec'    => isset($row['cfv_25'])            ? (string)$row['cfv_25']            : '',
             'min_stock_level'  => isset($row['cfv_31'])            ? (string)$row['cfv_31']            : '',

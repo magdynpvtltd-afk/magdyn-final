@@ -607,6 +607,97 @@ function inspection_render_old_import_result(array $result, ?string $fatalError)
     require __DIR__ . '/includes/footer.php';
 }
 
+/**
+ * Templates whose checklist carries no real (dimensional) check — every
+ * parameter is a placeholder line: a visual check, or a stub named exactly
+ * "NA" or "0". Returns each such template with its parameter rows, ready for
+ * the pre-delete log preview. (Templates with ≥1 item only.)
+ *
+ * "Visual" lives in the parameter NAME (legacy `Parametername` → item `label`),
+ * not in `check_type`: the old `toltype` column has no 'visual' value, so the
+ * importer almost never set check_type='visual'. We therefore match the same
+ * way the legacy report did — `label LIKE '%visual%'` — plus the exact stub
+ * labels "NA" / "0", and treat a template as deletable only when *every* item
+ * matches (so a template mixing NA with a real dimensional check is kept).
+ * A template with no items at all is excluded (it has no checklist to judge).
+ *
+ * @return array<int,array<string,mixed>>
+ */
+function inspection_visual_only_templates(): array {
+    $rows = db_all(
+        "SELECT t.id, t.code, t.name, t.inspection_type
+           FROM inspection_templates t
+          WHERE EXISTS (SELECT 1 FROM inspection_template_items i WHERE i.template_id = t.id)
+            AND NOT EXISTS (SELECT 1 FROM inspection_template_items i
+                             WHERE i.template_id = t.id
+                               AND NOT (i.label LIKE '%visual%' OR i.label = 'NA' OR i.label = '0'))
+          ORDER BY t.code, t.name"
+    );
+    $out = [];
+    foreach ($rows as $t) {
+        $items = db_all(
+            'SELECT sort_order, label, bubble_no, check_type, unit
+               FROM inspection_template_items
+              WHERE template_id = ?
+              ORDER BY sort_order, id',
+            [(int)$t['id']]
+        );
+        $out[] = [
+            'id'              => (int)$t['id'],
+            'code'            => (string)$t['code'],
+            'name'            => (string)$t['name'],
+            'inspection_type' => $t['inspection_type'],
+            'item_count'      => count($items),
+            'items'           => $items,
+        ];
+    }
+    return $out;
+}
+
+// ── POST (AJAX/JSON): preview templates whose checklist is ALL 'visual' ──────
+// Lists each visual-only template and its parameters so the admin can review
+// exactly what will be removed before committing the delete.
+if ($action === 'visual_templates_preview') {
+    header('Content-Type: application/json; charset=utf-8');
+    require_permission('inspection', 'manage');
+    csrf_check();
+    try {
+        $templates = inspection_visual_only_templates();
+        echo json_encode(['ok' => true, 'count' => count($templates), 'templates' => $templates]);
+    } catch (Throwable $e) {
+        echo json_encode(['ok' => false, 'error' => $e->getMessage()]);
+    }
+    exit;
+}
+
+// ── POST: delete every template whose checklist is ALL 'visual' checks ───────
+// Recomputes the set server-side (never trusts the previewed list) so a delete
+// only ever removes templates that still qualify at commit time.
+if ($action === 'delete_visual_templates') {
+    require_permission('inspection', 'manage');
+    csrf_check();
+    try {
+        $ids = array_map(static fn($t) => (int)$t['id'], inspection_visual_only_templates());
+        $count = count($ids);
+        if ($count > 0) {
+            $ph = implode(',', array_fill(0, $count, '?'));
+            // Unlink any physical template attachment files before the FK
+            // cascade drops their metadata rows (as Delete All Templates does).
+            foreach (db_all("SELECT stored_path FROM inspection_template_attachments WHERE template_id IN ($ph)", $ids) as $a) {
+                $p = __DIR__ . '/' . ltrim((string)$a['stored_path'], '/');
+                if (is_file($p)) { @unlink($p); }
+            }
+            // Items / targets / attachments cascade via FK ON DELETE CASCADE.
+            db_exec("DELETE FROM inspection_templates WHERE id IN ($ph)", $ids);
+        }
+        flash_set('success', "Deleted {$count} visual-only inspection template" . ($count === 1 ? '' : 's')
+            . ' (their items, targets, and attachments were removed too).');
+    } catch (Throwable $e) {
+        flash_set('error', 'Delete failed: ' . $e->getMessage());
+    }
+    redirect(url('/inspection.php?action=import_old_templates'));
+}
+
 // ── POST: delete all imported templates (code LIKE 'OINS-%') ─────────────────
 if ($action === 'delete_old_templates') {
     require_permission('inspection', 'manage');
@@ -858,6 +949,91 @@ if ($action === 'import_old_templates') {
                         <button type="submit" class="btn btn-danger">🗑 Delete All Templates</button>
                     </form>
                 </div>
+
+                <hr style="border:none;border-top:1px solid #fecaca;margin:18px 0;">
+                <p style="margin:0 0 10px;font-size:14px;color:#7f1d1d;">
+                    <strong>Delete Visual-Only Templates</strong> — removes every template that carries no real
+                    check: each parameter is either a visual line (name contains "visual") or a stub named exactly
+                    <code>NA</code> or <code>0</code>. Templates that also have a dimensional (nom / min-max) check
+                    are kept. Click <strong>Preview</strong> first to list each affected template and its
+                    parameters in the log below; the delete button stays disabled until you do.
+                </p>
+                <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+                    <button type="button" class="btn btn-ghost" id="visual-preview-btn"
+                            data-url="<?= h(url('/inspection.php?action=visual_templates_preview')) ?>"
+                            data-csrf-name="<?= h($GLOBALS['APP']['csrf_field']) ?>"
+                            data-csrf-token="<?= h(csrf_token()) ?>">🔍 Preview Visual-Only Templates</button>
+                    <form method="post" action="<?= h(url('/inspection.php?action=delete_visual_templates')) ?>"
+                          id="visual-delete-form"
+                          onsubmit="return confirm('This will permanently delete every inspection template whose checklist carries no real check (every parameter is visual, NA, or 0), including their items, targets, and attachments.\n\nThis cannot be undone. Are you sure?');">
+                        <?= csrf_field() ?>
+                        <button type="submit" class="btn btn-danger" id="visual-delete-btn" disabled>🗑 Delete Visual-Only Templates</button>
+                    </form>
+                </div>
+                <pre id="visual-log" style="display:none;margin:12px 0 0;padding:12px 14px;background:#1e1e1e;
+                     color:#e5e7eb;border-radius:8px;font-size:12px;line-height:1.5;max-height:340px;overflow:auto;
+                     white-space:pre-wrap;"></pre>
+
+                <script>
+                (function () {
+                    var btn = document.getElementById('visual-preview-btn');
+                    if (!btn) return;
+                    var log    = document.getElementById('visual-log');
+                    var delBtn = document.getElementById('visual-delete-btn');
+
+                    function line(s) { log.textContent += s + '\n'; }
+
+                    btn.addEventListener('click', async function () {
+                        var orig = btn.textContent;
+                        btn.disabled = true;
+                        btn.textContent = '⏳ Loading…';
+                        delBtn.disabled = true;
+                        log.style.display = 'block';
+                        log.textContent = '';
+                        try {
+                            var body = new URLSearchParams();
+                            body.append(btn.dataset.csrfName, btn.dataset.csrfToken);
+                            var resp = await fetch(btn.dataset.url, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
+                                body: body.toString()
+                            });
+                            var text = await resp.text(), data;
+                            try { data = JSON.parse(text); }
+                            catch (e) { throw new Error('Server returned non-JSON (HTTP ' + resp.status + '): ' + text.substring(0, 200)); }
+                            if (!data.ok) throw new Error(data.error || 'Unknown server error');
+
+                            line('Visual-only inspection templates found: ' + data.count);
+                            line('======================================================');
+                            if (data.count === 0) {
+                                line('(none — nothing to delete)');
+                            } else {
+                                data.templates.forEach(function (t, idx) {
+                                    line('');
+                                    line((idx + 1) + '. [' + t.code + '] ' + t.name +
+                                         '   (type: ' + (t.inspection_type || '—') + ', items: ' + t.item_count + ')');
+                                    t.items.forEach(function (it) {
+                                        line('       • ' + (it.label || '(no label)') +
+                                             (it.bubble_no ? '   bubble ' + it.bubble_no : '') +
+                                             '   [' + it.check_type + ']' +
+                                             (it.unit ? '   ' + it.unit : ''));
+                                    });
+                                });
+                                line('');
+                                line('------------------------------------------------------');
+                                line('Total: ' + data.count + ' template(s) will be deleted.');
+                            }
+                            delBtn.disabled = (data.count === 0);
+                        } catch (e) {
+                            line('❌ ' + e.message);
+                            delBtn.disabled = true;
+                        } finally {
+                            btn.disabled = false;
+                            btn.textContent = orig;
+                        }
+                    });
+                })();
+                </script>
             </div>
             <?php endif; ?>
 
@@ -2783,8 +2959,11 @@ if ($action === 'templates') {
         . ($canCreate
             ? ' <button type="button" class="btn btn-ghost btn-sm" id="tpl-import-btn"'
               . ' title="Create a new template from a CSV file">⤒ Import CSV</button>'
-              . ' <a class="btn btn-ghost btn-sm" href="' . h(url('/inspection.php?action=import_old_templates')) . '"'
-              . ' title="Import inspection templates from the old inventory system">⬇ Import from Old Inventory</a>'
+              // Old-inventory import is admin-only (Admin ▸ Old Inventory Import).
+              . (is_admin()
+                  ? ' <a class="btn btn-ghost btn-sm" href="' . h(url('/inspection.php?action=import_old_templates')) . '"'
+                    . ' title="Import inspection templates from the old inventory system">⬇ Import from Old Inventory</a>'
+                  : '')
               . ' <a class="btn btn-primary btn-sm" href="' . h(url('/inspection.php?action=template_new')) . '"'
               . ' data-shortcut="N" accesskey="n">' . shortcut_label('+ New template', 'N') . '</a>'
             : '');
@@ -5734,8 +5913,11 @@ $rightActions =
         ? ' <button type="button" class="btn btn-ghost btn-sm"'
           . ' data-open-import="inspection-import-modal"'
           . ' title="Import inspection records from CSV">⤒ Import CSV</button>'
-          . ' <a class="btn btn-ghost btn-sm" href="' . h(url('/inspection.php?action=import_old_inspections')) . '"'
-          . ' title="Import inspection records from the old inventory system">⬇ Import from Old Inventory</a>'
+          // Old-inventory import is admin-only (Admin ▸ Old Inventory Import).
+          . (is_admin()
+              ? ' <a class="btn btn-ghost btn-sm" href="' . h(url('/inspection.php?action=import_old_inspections')) . '"'
+                . ' title="Import inspection records from the old inventory system">⬇ Import from Old Inventory</a>'
+              : '')
           . ' <a class="btn btn-primary btn-sm" href="' . h(url('/inspection.php?action=new')) . '"'
           . ' data-shortcut="N" accesskey="n">' . shortcut_label('+ New inspection', 'N') . '</a>'
         : '');

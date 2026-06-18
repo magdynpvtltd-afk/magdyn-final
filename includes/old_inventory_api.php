@@ -195,6 +195,87 @@ function old_inventory_notes_api(string $action, array $params = []): array
 }
 
 /**
+ * MagDyn — download a binary file from api_export_notes.php (notes_url).
+ *
+ * Used by the note-attachment file importer: the old server streams the
+ * physical file for a given attachment (located on disk by its original
+ * filename), and we write it straight to $destPath without buffering the
+ * whole payload in memory.
+ *
+ * Returns an array describing the outcome (never throws):
+ *   [ 'ok' => true,  'status' => 200, 'bytes' => 12345, 'mime' => '...' ]
+ *   [ 'ok' => false, 'status' => 404, 'error' => 'File missing on disk: …' ]
+ *
+ * A JSON body (the API's error shape) or any non-200 status is treated as a
+ * failure, so callers can tell "missing on source" (404) apart from success.
+ *
+ * @param array  $params   Query params (e.g. ['action' => 'attachment_file', 'tmp' => '<hash>'])
+ * @param string $destPath Absolute path to write the file to on success
+ */
+function old_inventory_notes_api_download(array $params, string $destPath): array
+{
+    static $cfg = null;
+    if ($cfg === null) {
+        $cfg = require __DIR__ . '/../config/old_inventory_api.php';
+    }
+    if (empty($cfg['notes_url'])) {
+        return ['ok' => false, 'status' => 0, 'error' => 'notes_url not set in config/old_inventory_api.php.'];
+    }
+
+    $params['token'] = $cfg['token'];
+    $url = rtrim($cfg['notes_url'], '/') . '?' . http_build_query($params);
+
+    $ctx = stream_context_create([
+        'http' => [
+            'method'        => 'GET',
+            'timeout'       => $cfg['timeout'],
+            'header'        => "Connection: close\r\n",
+            'ignore_errors' => true,   // still expose 4xx/5xx bodies
+        ],
+    ]);
+
+    $in = @fopen($url, 'rb', false, $ctx);
+    if ($in === false) {
+        return ['ok' => false, 'status' => 0, 'error' => 'Could not reach ' . $cfg['notes_url']];
+    }
+
+    // Parse status + content-type from the response headers PHP populates.
+    $status = 0;
+    $ctype  = '';
+    $hdrs   = isset($http_response_header) ? $http_response_header : [];
+    foreach ($hdrs as $h) {
+        if (preg_match('#^HTTP/\S+\s+(\d{3})#', $h, $m)) { $status = (int) $m[1]; }
+        if (stripos($h, 'Content-Type:') === 0)          { $ctype  = trim(substr($h, 13)); }
+    }
+
+    // The API signals errors as JSON (any status) — treat JSON or non-200 as a miss.
+    if ($status !== 200 || stripos($ctype, 'application/json') !== false) {
+        $body = stream_get_contents($in, 8192);
+        fclose($in);
+        $err  = 'HTTP ' . $status;
+        $j    = json_decode((string) $body, true);
+        if (is_array($j) && isset($j['error'])) { $err = $j['error']; }
+        return ['ok' => false, 'status' => $status, 'error' => $err];
+    }
+
+    $out = @fopen($destPath, 'wb');
+    if ($out === false) {
+        fclose($in);
+        return ['ok' => false, 'status' => $status, 'error' => 'Cannot open destination: ' . $destPath];
+    }
+    $bytes = stream_copy_to_stream($in, $out);
+    fclose($in);
+    fclose($out);
+
+    if ($bytes === false) {
+        @unlink($destPath);
+        return ['ok' => false, 'status' => $status, 'error' => 'Stream copy failed.'];
+    }
+
+    return ['ok' => true, 'status' => $status, 'bytes' => (int) $bytes, 'mime' => $ctype];
+}
+
+/**
  * MagDyn — Old Inventory invoice export API client.
  *
  * Same contract as old_inventory_api() but targets api_export_invoices.php
