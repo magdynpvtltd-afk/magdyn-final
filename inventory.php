@@ -70,7 +70,7 @@ if (!$canViewItems && !$canViewBoms) {
 // re-route to the wrong file.
 // ============================================================
 $itemActions = [
-    'items', 'item_new', 'item_edit', 'item_save', 'item_delete',
+    'items', 'item_new', 'item_edit', 'item_view', 'item_save', 'item_delete',
     'item_clone', 'item_toggle_active', 'item_billing_push',
     'item_import_preview', 'item_import_commit',
 ];

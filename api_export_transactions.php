@@ -12,6 +12,8 @@
  *   ?action=all_shipments_json [&offset=0&limit=500]
  *   ?action=all_receipts_json  [&offset=0&limit=500]
  *   ?action=all_po_json        [&offset=0&limit=500]
+ *   ?action=uom_count                     count of inventory_model rows
+ *   ?action=all_uom_json       [&offset=0&limit=500]  per-model I_UOM value
  */
 
 define('API_TOKEN', 'MAGDYN_IMPORT_SECRET');
@@ -527,6 +529,76 @@ if ($action === 'all_receipts_with_lines_json') {
     }
 
     echo json_encode(array('receipts' => $receipts, 'count' => count($receipts)));
+    exit;
+}
+
+// ------------------------------------------------------------------
+// uom_count — number of inventory_model rows (for progress display)
+// ------------------------------------------------------------------
+if ($action === 'uom_count') {
+    $res = mysqli_query($con, 'SELECT COUNT(*) FROM inventory_model');
+    if (!$res) {
+        echo json_encode(array('error' => 'Count query failed: ' . mysqli_error($con)));
+        exit;
+    }
+    $row = mysqli_fetch_row($res);
+    echo json_encode(array('count' => (int)$row[0]));
+    exit;
+}
+
+// ------------------------------------------------------------------
+// all_uom_json — each inventory model's I_UOM custom-field value, paginated.
+//
+// I_UOM is a custom field on inventory models. Its option text is stored
+// directly in inventory_model_custom_field_helper, in the column
+// cfv_<id> where <id> is the custom_field.custom_field_id whose
+// short_description is 'I_UOM' (id 14 on the live DB). We resolve that id
+// from `custom_field` first so the helper column name isn't hard-coded,
+// then read the matching cfv_ column (the helper already holds the
+// human-readable option text — no join to custom_field_value needed).
+//
+// Returns: {"uom": [{model_id, model_code, model_name, uom}, ...], "count": N}
+// ------------------------------------------------------------------
+if ($action === 'all_uom_json') {
+    // 1. Resolve the I_UOM custom_field_id → helper column name (cfv_<id>).
+    $cfRes = mysqli_query($con,
+        "SELECT custom_field_id FROM custom_field WHERE short_description = 'I_UOM' LIMIT 1");
+    if (!$cfRes) {
+        echo json_encode(array('error' => 'custom_field lookup failed: ' . mysqli_error($con)));
+        exit;
+    }
+    $cfRow = mysqli_fetch_row($cfRes);
+    if (!$cfRow) {
+        echo json_encode(array('error' => "No custom_field named 'I_UOM' found on the old server."));
+        exit;
+    }
+    $uomCol = 'cfv_' . (int)$cfRow[0];
+
+    // 2. inventory_model JOIN helper, reading the resolved I_UOM column.
+    //    LEFT JOIN so models without a helper row still page consistently
+    //    (their uom comes back NULL and is skipped by the importer).
+    $sql = "
+        SELECT
+            im.inventory_model_id    AS model_id,
+            im.inventory_model_code  AS model_code,
+            im.short_description     AS model_name,
+            h.`$uomCol`              AS uom
+        FROM inventory_model im
+        LEFT JOIN inventory_model_custom_field_helper h
+            ON h.inventory_model_id = im.inventory_model_id
+        ORDER BY im.inventory_model_id ASC
+        LIMIT " . $limit . " OFFSET " . $offset . "
+    ";
+    $res = mysqli_query($con, $sql);
+    if (!$res) {
+        echo json_encode(array('error' => 'Query failed: ' . mysqli_error($con)));
+        exit;
+    }
+    $rows = array();
+    while ($row = mysqli_fetch_assoc($res)) {
+        $rows[] = $row;
+    }
+    echo json_encode(array('uom' => $rows, 'count' => count($rows)));
     exit;
 }
 

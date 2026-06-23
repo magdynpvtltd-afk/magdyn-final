@@ -1177,6 +1177,7 @@ if ($action === 'txn_save') {
     // mirrored onto the asset as its current checkout_due_on (cleared on
     // any non-checkout transaction).
     $isCheckout = in_array($type, ['send_vendor', 'send_user'], true);
+    $isCheckin  = in_array($type, ['receive_vendor', 'receive_user'], true);
     $dueDate = null;
     if ($isCheckout) {
         $dueRaw = trim((string)input('due_date', ''));
@@ -1184,6 +1185,21 @@ if ($action === 'txn_save') {
             $ts = strtotime($dueRaw);
             if ($ts !== false && date('Y-m-d', $ts) === $dueRaw) {
                 $dueDate = $dueRaw;
+            }
+        }
+    }
+
+    // Business date for THIS event — the "Issued date" on a check-out or the
+    // "Checked in date" on a check-in. Stored as asset_transactions.txn_date
+    // so it can differ from the system entry timestamp (at). Only captured
+    // for check-out / check-in; moves carry no such date.
+    $txnDate = null;
+    if ($isCheckout || $isCheckin) {
+        $txnRaw = trim((string)input('txn_date', ''));
+        if ($txnRaw !== '' && preg_match('/^\d{4}-\d{2}-\d{2}$/', $txnRaw)) {
+            $ts = strtotime($txnRaw);
+            if ($ts !== false && date('Y-m-d', $ts) === $txnRaw) {
+                $txnDate = $txnRaw;
             }
         }
     }
@@ -1238,10 +1254,10 @@ if ($action === 'txn_save') {
     db_exec(
         "INSERT INTO asset_transactions
           (asset_id, txn_type, from_location_id, from_vendor_id, from_user_id,
-           to_location_id, to_vendor_id, to_user_id, actor_id, notes, due_date)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+           to_location_id, to_vendor_id, to_user_id, actor_id, notes, due_date, txn_date)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [$assetId, $type, $from_loc, $from_vendor, $from_user,
-         $to_loc, $to_vendor, $to_user, $uid, $notes, $dueDate]
+         $to_loc, $to_vendor, $to_user, $uid, $notes, $dueDate, $txnDate]
     );
     // checkout_due_on tracks the asset's CURRENT expected return. On a
     // checkout it takes the new due date; on a move/check-in it clears.
@@ -2162,7 +2178,7 @@ if ($action === 'view') {
         </div>
         <table class="data-table">
             <thead>
-            <tr><th>Issued</th><th>Due</th><th>Type</th><th>In / Out</th><th>From</th><th>To</th><th>By</th><th>Notes</th><th class="r">Files</th><th class="r">Actions</th></tr>
+            <tr><th>Txn ID</th><th>Issued/Checked in</th><th>Due</th><th>Type</th><th>In / Out</th><th>From</th><th>To</th><th>By</th><th>Notes</th><th class="r">Files</th><th class="r">Actions</th></tr>
             </thead>
             <tbody>
             <?php
@@ -2181,7 +2197,7 @@ if ($action === 'view') {
             ];
             ?>
             <?php if (!$txns): ?>
-                <tr><td colspan="10" class="empty">No transactions yet.</td></tr>
+                <tr><td colspan="11" class="empty">No transactions yet.</td></tr>
             <?php else: foreach ($txns as $t):
                 $from = $t['from_loc_name'] ?: ($t['from_vendor_name'] ?: ($t['from_user_name'] ?: '—'));
                 $to   = $t['to_loc_name']   ?: ($t['to_vendor_name']   ?: ($t['to_user_name']   ?: '—'));
@@ -2205,7 +2221,8 @@ if ($action === 'view') {
                 $attCount = (int)($txnAttCounts[(int)$t['id']] ?? 0);
                 ?>
                 <tr>
-                    <td class="nowrap"><?= h(dt_display($t['at'])) ?></td>
+                    <td class="nowrap"><code>#<?= (int)$t['id'] ?></code></td>
+                    <td class="nowrap"><?= !empty($t['txn_date']) ? h($t['txn_date']) : h(dt_display($t['at'])) ?></td>
                     <td class="nowrap"><?php if ($rowDue): ?><span class="<?= $rowDueCls ?>"><?= h($rowDue) ?></span><?php else: ?><span class="muted small">—</span><?php endif; ?></td>
                     <td><code><?= h(str_replace('_',' ', $tt)) ?></code></td>
                     <td>
@@ -2416,6 +2433,10 @@ if ($action === 'txn') {
                     $showVen = ($txnPreset === 'send_vendor');
                     $showUsr = ($txnPreset === 'send_user');
                     $showDue = in_array($txnPreset, ['send_vendor','send_user']);
+                    $showCheckout = in_array($txnPreset, ['send_vendor','send_user']);
+                    $showCheckin  = in_array($txnPreset, ['receive_vendor','receive_user']);
+                    $showTxnDate  = $showCheckout || $showCheckin;
+                    $txnDateLabel = $showCheckin ? 'Checked in date' : 'Issued date';
                 ?>
 
                 <div class="field js-loc-target"<?= $showLoc ? '' : ' style="display:none;"' ?>>
@@ -2448,14 +2469,20 @@ if ($action === 'txn') {
                     </select>
                 </div>
 
+                <div class="field js-txndate-target"<?= $showTxnDate ? '' : ' style="display:none;"' ?>>
+                    <label for="f_txn_date"><span class="js-txndate-label"><?= h($txnDateLabel) ?></span></label>
+                    <input id="f_txn_date" name="txn_date" type="date" tabindex="5"
+                           value="<?= h(date('Y-m-d')) ?>">
+                </div>
+
                 <div class="field js-due-target"<?= $showDue ? '' : ' style="display:none;"' ?>>
                     <label for="f_txn_due">Due date <span class="muted small">(expected return)</span></label>
-                    <input id="f_txn_due" name="due_date" type="date" tabindex="5">
+                    <input id="f_txn_due" name="due_date" type="date" tabindex="6">
                 </div>
 
                 <div class="field span-2">
                     <label for="f_txn_notes">Notes</label>
-                    <input id="f_txn_notes" name="notes" type="text" tabindex="6">
+                    <input id="f_txn_notes" name="notes" type="text" tabindex="7">
                 </div>
             </div>
         </form>
@@ -2468,6 +2495,8 @@ if ($action === 'txn') {
         var ven = document.querySelector('.js-vendor-target');
         var usr = document.querySelector('.js-user-target');
         var due = document.querySelector('.js-due-target');
+        var txnDate = document.querySelector('.js-txndate-target');
+        var txnDateLbl = document.querySelector('.js-txndate-label');
 
         // ── Destination visibility rules ─────────────────────────────────
         // move            → location list  (location → location)
@@ -2481,10 +2510,14 @@ if ($action === 'txn') {
             var wantsVen = (t === 'send_vendor');
             var wantsUsr = (t === 'send_user');
             var wantsDue = (t === 'send_vendor' || t === 'send_user');
+            var wantsCheckin  = (t === 'receive_vendor' || t === 'receive_user');
+            var wantsTxnDate  = wantsDue || wantsCheckin;
             loc.style.display = wantsLoc ? '' : 'none';
             ven.style.display = wantsVen ? '' : 'none';
             usr.style.display = wantsUsr ? '' : 'none';
             due.style.display = wantsDue ? '' : 'none';
+            if (txnDate) txnDate.style.display = wantsTxnDate ? '' : 'none';
+            if (txnDateLbl) txnDateLbl.textContent = wantsCheckin ? 'Checked in date' : 'Issued date';
         }
 
         sel.addEventListener('change', apply);
@@ -2558,6 +2591,7 @@ if ($action === 'txn_history') {
                               t.from_user_id, t.to_user_id,
                               t.from_vendor_id, t.to_vendor_id,
                               t.calibration_done_on, t.next_cal_due_on,
+                              t.txn_date,
                               a.asset_tag,
                               am.name AS model_name,
                               f_loc.name AS from_loc_name, t_loc.name AS to_loc_name,
@@ -2575,7 +2609,11 @@ if ($action === 'txn_history') {
                          LEFT JOIN vendors   t_v   ON t_v.id   = t.to_vendor_id
                          LEFT JOIN users     act   ON act.id   = t.actor_id",
         'columns'  => [
+            ['key'=>'id',           'label'=>'Txn ID',   'sortable'=>true,  'searchable'=>true,  'sql_col'=>'t.id',
+             'td_class'=>'nowrap'],
             ['key'=>'at',           'label'=>'When',     'sortable'=>true,  'searchable'=>false, 'sql_col'=>'t.at',
+             'td_class'=>'nowrap'],
+            ['key'=>'txn_date',     'label'=>'Issued / Checked in', 'sortable'=>true, 'searchable'=>true, 'sql_col'=>'t.txn_date',
              'td_class'=>'nowrap'],
             ['key'=>'txn_type',     'label'=>'Type',     'sortable'=>true,  'sql_col'=>'t.txn_type',
              'filter' => ['type'=>'select', 'placeholder'=>'all', 'options'=>$typeFilterOptions]],
@@ -2708,7 +2746,9 @@ if ($action === 'txn_history') {
                  . '👁 <span class="dt-action-label">View asset</span></a>';
 
         return [
+            'id'           => '<code>#' . (int)$r['id'] . '</code>',
             'at'           => h(dt_display($r['at'])),
+            'txn_date'     => !empty($r['txn_date']) ? h($r['txn_date']) : '<span class="muted">—</span>',
             'txn_type'     => $typePill,
             'asset_tag'    => $assetLink,
             'model_name'   => h($r['model_name'] ?: '—'),
@@ -2768,8 +2808,9 @@ if ($action === 'list') {
                               l.name AS location_name, v.name AS vendor_name, u.full_name AS user_name,
                               cf.label AS cal_freq_label, eg.label AS engraved_label,
                               co.label AS calibration_label, ck.label AS checked_label,
-                              (SELECT t.at FROM asset_transactions t
-                                WHERE t.asset_id = a.id AND t.txn_type IN ("send_vendor","send_user")
+                              (SELECT COALESCE(t.txn_date, DATE(t.at)) FROM asset_transactions t
+                                WHERE t.asset_id = a.id
+                                  AND t.txn_type IN ("send_vendor","send_user","receive_vendor","receive_user")
                                 ORDER BY t.at DESC, t.id DESC LIMIT 1) AS checkout_issued_at,
                               (SELECT COUNT(na.id) FROM note_attachments na
                                  JOIN notes n ON n.id = na.note_id
@@ -2792,7 +2833,7 @@ if ($action === 'list') {
             ['key'=>'holder',          'label'=>'Location / holder', 'sortable'=>false,'searchable'=>true, 'sql_col'=>'CONCAT_WS(" ", l.name, v.name, u.full_name)'],
             // Issued / Due back — set when the asset is checked out; only
             // meaningful while it's with a vendor/user.
-            ['key'=>'checkout_issued_on', 'label'=>'Issued',         'sortable'=>false,'searchable'=>false],
+            ['key'=>'checkout_issued_on', 'label'=>'Issued/Checked in', 'sortable'=>false,'searchable'=>false],
             ['key'=>'checkout_due_on', 'label'=>'Due back',          'sortable'=>true, 'searchable'=>true, 'sql_col'=>'a.checkout_due_on'],
             // Next cal due is now text-filterable. The column stores
             // YYYY-MM-DD so typing '2026-03' or '03-14' both work via LIKE.
@@ -2842,9 +2883,11 @@ if ($action === 'list') {
             $holder = $a['location_name'] ?: '—';
         }
 
-        // Issued / Due-back dates: only meaningful while checked out.
-        $isOut    = ($a['status'] === 'with_vendor' || $a['status'] === 'with_user');
-        $coIssued = $isOut && !empty($a['checkout_issued_at']) ? substr((string)$a['checkout_issued_at'], 0, 10) : '';
+        // Issued / Checked-in date: the most recent check-out or check-in
+        // event for this asset — mirrors the top row of the asset's
+        // transaction-history "Issued/Checked in" column. Shown whether the
+        // asset is currently out or back in stock.
+        $coIssued = !empty($a['checkout_issued_at']) ? substr((string)$a['checkout_issued_at'], 0, 10) : '';
         // Always show checkout_due_on when a value is stored, regardless of
         // status. Imported assets from old inventory arrive as 'active' but
         // may still carry a due-back date from when they were last checked out.
@@ -3040,6 +3083,11 @@ if ($action === 'list') {
                     </select>
                 </div>
 
+                <div class="field" id="modal-txndate-field" style="display:none;">
+                    <label for="modal-txn-date"><span id="modal-txndate-label">Issued date</span></label>
+                    <input id="modal-txn-date" name="txn_date" type="date">
+                </div>
+
                 <div class="field" id="modal-due-field" style="display:none;">
                     <label for="modal-txn-due">Due date <span class="muted small">(expected return)</span></label>
                     <input id="modal-txn-due" name="due_date" type="date">
@@ -3070,6 +3118,9 @@ if ($action === 'list') {
         var usrF    = document.getElementById('modal-user-field');
         var dueF    = document.getElementById('modal-due-field');
         var dueInp  = document.getElementById('modal-txn-due');
+        var dateF   = document.getElementById('modal-txndate-field');
+        var dateInp = document.getElementById('modal-txn-date');
+        var dateLbl = document.getElementById('modal-txndate-label');
         var notesInp= document.getElementById('modal-txn-notes');
 
         function applyType(t) {
@@ -3077,12 +3128,15 @@ if ($action === 'list') {
                 var ts = document.getElementById('modal-txn-type');
                 t = ts ? ts.value : 'move';
             }
-            var isSendOut = (t === 'send_vendor' || t === 'send_user');
+            var isSendOut    = (t === 'send_vendor' || t === 'send_user');
+            var isCheckin    = (t === 'receive_vendor' || t === 'receive_user');
             // Location: shown for move, receive_vendor, receive_user
             locF.style.display = isSendOut              ? 'none'  : 'block';
             venF.style.display = (t === 'send_vendor')  ? 'block' : 'none';
             usrF.style.display = (t === 'send_user')    ? 'block' : 'none';
             dueF.style.display = isSendOut              ? 'block' : 'none';
+            dateF.style.display = (isSendOut || isCheckin) ? 'block' : 'none';
+            if (dateLbl) dateLbl.textContent = isCheckin ? 'Checked in date' : 'Issued date';
         }
         typeSel.addEventListener('change', function () { applyType(this.value); });
 
@@ -3096,8 +3150,17 @@ if ($action === 'list') {
                 var s = f.querySelector('select');
                 if (s) s.selectedIndex = 0;
             });
+            // The location select is combobox-enhanced; resetting selectedIndex
+            // alone leaves the combobox's visible input showing the PREVIOUS
+            // pick. Resync so the displayed text matches the reset (empty)
+            // value — otherwise a stale label looks selected but posts nothing.
+            if (window.MagDynCombobox && window.MagDynCombobox.resync) {
+                window.MagDynCombobox.resync(modal);
+            }
             notesInp.value = '';
             if (dueInp) dueInp.value = '';
+            // Default the issued / checked-in date to today (editable).
+            if (dateInp) dateInp.value = '<?= h(date('Y-m-d')) ?>';
             modal.style.display = '';
 
             var targetType = preset || 'move';

@@ -140,11 +140,13 @@ if ($view !== '') {
 // "Open standalone" link, opened in a new tab) gets the tool's full
 // native UI with its own sidebar intact.
 //
-// Exception: the Weight and Engineering calculators are no longer nested
-// in the sidebar (their sub-tools were removed from the nav), so they
-// must keep their OWN internal menu visible to stay navigable. Render
-// them non-embedded.
-$KEEP_OWN_NAV = ['weight', 'calc'];
+// The Weight & Material calculator's inner tab sidebar (Calculator /
+// Hardness / Shore) is hidden when embedded — it's a "tab inside a tab"
+// next to the MagDyn chrome — and is shown ONLY in standalone mode. So
+// it is NOT in this keep-own-nav list. The Engineering Calculator stays
+// non-embedded for now (its sub-tools were removed from the MagDyn nav,
+// so it must keep its own internal menu to stay navigable).
+$KEEP_OWN_NAV = ['calc'];
 if (!in_array($tool, $KEEP_OWN_NAV, true)) {
     $iframeSrc .= ($view !== '' ? '&' : '?') . 'embed=1';
 }

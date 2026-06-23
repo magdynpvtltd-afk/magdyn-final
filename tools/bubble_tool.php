@@ -1165,6 +1165,38 @@ if ($tplSession !== ''): ?>
     + 'starting_number=' + window.MAGDYN_TPL_BUBBLE.starting_number);
 </script>
 <?php endif; ?>
+<?php
+// ----------------------------------------------------------------
+// Instrument options for the per-bubble "Instrument" picker in the
+// detail editor. This mirrors the instrument <select> on the
+// inspection template editor (inspection.php), so a bubble's
+// instrument choice round-trips into inspection_template_items.
+// Active = not archived (the assets table tracks activity via status).
+// Emitted as a plain {id,label} list the JS turns into <option>s.
+// Best-effort: if the assets table isn't present we emit an empty
+// list and the dropdown just shows "— None —".
+// ----------------------------------------------------------------
+$bubbleInstrumentOptions = [];
+try {
+    $rows = db_all("SELECT a.id, a.asset_tag AS code, m.name AS model_name
+                      FROM assets a
+                 LEFT JOIN asset_models m ON m.id = a.model_id
+                     WHERE a.status <> 'archived'
+                  ORDER BY a.asset_tag");
+    foreach ($rows as $r) {
+        $label = (string)$r['code'];
+        if (!empty($r['model_name'])) $label .= ' — ' . $r['model_name'];
+        $bubbleInstrumentOptions[] = ['id' => (int)$r['id'], 'label' => $label];
+    }
+} catch (\Throwable $e) {
+    // assets table missing or query failed — leave list empty.
+    $bubbleInstrumentOptions = [];
+}
+?>
+<script>
+  // Active instruments (assets) for the per-bubble Instrument picker.
+  window.MAGDYN_INSTRUMENT_OPTIONS = <?= json_encode($bubbleInstrumentOptions, JSON_UNESCAPED_UNICODE) ?>;
+</script>
 </head>
 
 <body>
@@ -2533,7 +2565,12 @@ if ($tplSession !== ''): ?>
         gdtTol: '',         // GD&T tolerance value
         gdtDatum: '',       // datum references like "A|B|C"
         critical: false,    // key characteristic / critical-to-function flag
-        notes: ''           // free text
+        notes: '',          // free text
+        // Inspection-template fields (mirror the template item editor so a
+        // bubble round-trips cleanly into inspection_template_items).
+        checkType: '',      // '' = auto from dimension; else boolean|numeric|text|visual|nom|min-max|logic|logical-min-max|logical-nom|notes
+        instrumentId: '',   // active asset id used to measure this feature
+        required: true      // maps to inspection_template_items.is_required
       }
     };
     state.bubbles.push(bubble);
@@ -3702,6 +3739,37 @@ if ($tplSession !== ''): ?>
     }
   }
 
+  // Build <option>s for the per-bubble Instrument picker from the
+  // active-asset list PHP emitted (window.MAGDYN_INSTRUMENT_OPTIONS).
+  function instrumentOptionsHtml(selectedId) {
+    const opts = Array.isArray(window.MAGDYN_INSTRUMENT_OPTIONS)
+      ? window.MAGDYN_INSTRUMENT_OPTIONS : [];
+    let h = `<option value=""${String(selectedId || '') === '' ? ' selected' : ''}>— None —</option>`;
+    opts.forEach(o => {
+      const sel = String(selectedId || '') === String(o.id) ? ' selected' : '';
+      h += `<option value="${o.id}"${sel}>${escapeHtml(o.label)}</option>`;
+    });
+    return h;
+  }
+
+  // Check-type options — kept identical to the inspection template
+  // editor's dropdown so a bubble's choice maps 1:1 into the template.
+  // The leading "Auto" entry ('') lets the save-to-template step derive
+  // the type from the dimension (numeric when a nominal is present).
+  const CHECK_TYPES = [
+    { v: '',                label: 'Auto (from dimension)' },
+    { v: 'boolean',         label: 'Pass/Fail' },
+    { v: 'numeric',         label: 'Numeric' },
+    { v: 'text',            label: 'Text' },
+    { v: 'visual',          label: 'Visual' },
+    { v: 'nom',             label: 'NOM' },
+    { v: 'min-max',         label: 'MIN/MAX' },
+    { v: 'logic',           label: 'LOGIC' },
+    { v: 'logical-min-max', label: 'LOGICAL-MIN/MAX' },
+    { v: 'logical-nom',     label: 'LOGICAL-NOM' },
+    { v: 'notes',           label: 'NOTES' }
+  ];
+
   function buildDetailEditor(b) {
     const d = b.dim;
     const isGdt = d.type === 'gdt';
@@ -3734,6 +3802,11 @@ if ($tplSession !== ''): ?>
       </div>
 
       <div class="field-mini">
+        <label>Grid Cell</label>
+        <input type="text" data-field="gridCell" data-id="${b.id}" value="${escapeHtml(b.gridCell || '')}" maxlength="8" placeholder="e.g. A1 (auto if blank)">
+      </div>
+
+      <div class="field-mini">
         <label>Dimension Type</label>
         <select data-field="type" data-id="${b.id}">
           <option value="linear" ${d.type==='linear'?'selected':''}>Linear</option>
@@ -3742,6 +3815,13 @@ if ($tplSession !== ''): ?>
           <option value="angle" ${d.type==='angle'?'selected':''}>Angle (°)</option>
           <option value="reference" ${d.type==='reference'?'selected':''}>Reference (basic)</option>
           <option value="gdt" ${d.type==='gdt'?'selected':''}>GD&amp;T (Geometric)</option>
+        </select>
+      </div>
+
+      <div class="field-mini">
+        <label>Check Type</label>
+        <select data-field="checkType" data-id="${b.id}">
+          ${CHECK_TYPES.map(c => `<option value="${c.v}" ${d.checkType===c.v?'selected':''}>${escapeHtml(c.label)}</option>`).join('')}
         </select>
       </div>
 
@@ -3789,9 +3869,21 @@ if ($tplSession !== ''): ?>
       </div>
 
       <div class="field-mini">
+        <label>Instrument</label>
+        <select data-field="instrumentId" data-id="${b.id}">
+          ${instrumentOptionsHtml(d.instrumentId)}
+        </select>
+      </div>
+
+      <div class="field-mini">
         <label>Inspection Notes</label>
         <textarea data-field="notes" data-id="${b.id}" rows="2" placeholder="Method, gauge, AQL, etc.">${escapeHtml(d.notes)}</textarea>
       </div>
+
+      <label class="checkbox-row">
+        <input type="checkbox" data-field="required" data-id="${b.id}" ${d.required ? 'checked' : ''}>
+        <span>REQUIRED</span>
+      </label>
 
       <label class="checkbox-row">
         <input type="checkbox" data-field="critical" data-id="${b.id}" ${d.critical ? 'checked' : ''}>
@@ -3955,6 +4047,18 @@ if ($tplSession !== ''): ?>
         const field = input.dataset.field;
         if (field === 'label') {
           b.label = input.value;
+        } else if (field === 'gridCell') {
+          // Grid cell lives on the bubble (not dim). Cap at 8 chars to
+          // match inspection_template_items.bubble_grid_cell. Stored as
+          // typed (uppercased for the usual A1/B3 convention).
+          b.gridCell = input.value.slice(0, 8).toUpperCase();
+          if (input.value !== b.gridCell) input.value = b.gridCell;
+          syncPage();
+          return;
+        } else if (field === 'required') {
+          ensureDim(b).required = input.checked;
+          syncPage();
+          return;
         } else if (field === 'critical') {
           ensureDim(b).critical = input.checked;
           // Re-render so the danger-dot indicator updates on the summary
@@ -4026,6 +4130,8 @@ if ($tplSession !== ''): ?>
         tolPlus: '', tolMinus: '',
         gdtSym: '', gdtTol: '', gdtDatum: '',
         critical: false, notes: '',
+        // Inspection-template fields
+        checkType: '', instrumentId: '', required: true,
         // Auto-bubble fields
         rawText: '',         // exact text the parser saw on the drawing
         altRawText: '',      // alternate reading from the other engine (dual-engine)
@@ -4035,6 +4141,9 @@ if ($tplSession !== ''): ?>
       };
     }
     // Migrate older bubbles that lack the new fields
+    if (b.dim.checkType === undefined)       b.dim.checkType = '';
+    if (b.dim.instrumentId === undefined)    b.dim.instrumentId = '';
+    if (b.dim.required === undefined)        b.dim.required = true;
     if (b.dim.rawText === undefined)         b.dim.rawText = '';
     if (b.dim.altRawText === undefined)      b.dim.altRawText = '';
     if (b.dim.altSource === undefined)       b.dim.altSource = '';

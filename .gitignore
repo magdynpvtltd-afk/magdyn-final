@@ -3,5 +3,5 @@ magdyn-app_delta_*.zip
 delta_*.zip
 
 # Claude Code tooling state
-.claude/
+.claude/*
 uploads*

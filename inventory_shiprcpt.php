@@ -88,6 +88,66 @@ function shr_next_receipt_no()
     return code_next('receipt');
 }
 
+/** Next asset tag (A-NNNNN) — increment from the highest existing
+ *  numeric suffix. Mirrors asset.php's asset_id_generate() so a new
+ *  asset minted at receipt time gets the same sequence as one created
+ *  on the Assets page. (asset.php is a page controller and can't be
+ *  safely required here, so the small generator is duplicated.) */
+function shr_next_asset_tag()
+{
+    $cfg = $GLOBALS['APP']['asset_id'] ?? ['prefix' => 'A-', 'pad' => 5, 'start' => 1];
+    $prefix = (string)$cfg['prefix'];
+    $pad    = (int)$cfg['pad'];
+    $start  = (int)$cfg['start'];
+
+    $rows = db_all(
+        "SELECT asset_tag FROM assets WHERE asset_tag LIKE ? ORDER BY id DESC LIMIT 50",
+        [$prefix . '%']
+    );
+    $max = $start - 1;
+    foreach ($rows as $r) {
+        $suffix = substr($r['asset_tag'], strlen($prefix));
+        if (ctype_digit($suffix)) {
+            $n = (int)$suffix;
+            if ($n > $max) $max = $n;
+        }
+    }
+    $next = $max + 1;
+    for ($attempt = 0; $attempt < 50; $attempt++) {
+        $candidate = $prefix . str_pad((string)$next, $pad, '0', STR_PAD_LEFT);
+        if (!db_one('SELECT id FROM assets WHERE asset_tag = ?', [$candidate])) return $candidate;
+        $next++;
+    }
+    return $prefix . date('YmdHis');
+}
+
+/** Next asset-model code (MDL-NNN). Mirrors asset.php's
+ *  asset_model_next_code() for the same reason as above. */
+function shr_next_model_code()
+{
+    $prefix = 'MDL-';
+    $pad    = 3;
+    $rows = db_all(
+        "SELECT code FROM asset_models WHERE code LIKE ? ORDER BY id DESC LIMIT 50",
+        [$prefix . '%']
+    );
+    $max = 0;
+    foreach ($rows as $r) {
+        $suffix = substr($r['code'], strlen($prefix));
+        if (ctype_digit($suffix)) {
+            $n = (int)$suffix;
+            if ($n > $max) $max = $n;
+        }
+    }
+    $next = $max + 1;
+    for ($attempt = 0; $attempt < 50; $attempt++) {
+        $candidate = $prefix . str_pad((string)$next, $pad, '0', STR_PAD_LEFT);
+        if (!db_one('SELECT id FROM asset_models WHERE code = ?', [$candidate])) return $candidate;
+        $next++;
+    }
+    return $prefix . date('YmdHis');
+}
+
 /** Convenience: refresh a shipment line's qty_received aggregate from
  *  the sum of its inv_receipts. Called after receipt insert/delete. */
 function shr_recompute_line_received($lineId)
@@ -1780,15 +1840,83 @@ if ($action === 'receive_save') {
     }
 
     // ---- Phase C — pending (not-yet-existing) item branch ----
-    // Create the inv_items row at receipt time, bind it to the line,
-    // then fall through to the normal ledger-post receive flow below.
+    // A receive line flagged "New item" carries only a typed name. At
+    // receipt time the user chooses (in the Record-a-receipt form) whether
+    // this new thing is an INVENTORY item or an ASSET:
+    //   - asset     → mint a new asset (A-NNNNN) + a matching model with
+    //                 the same name, convert the line to an asset line,
+    //                 record the asset receipt, and return.
+    //   - inventory → create the inv_items row (I-NNNNN), storing the
+    //                 typed name in short_description, then fall through to
+    //                 the normal ledger-post receive flow below.
     if (empty($line['item_id']) && !empty($line['pending_name'])) {
-        $newCode = function_exists('inv_id_generate') ? inv_id_generate() : ('I-' . date('YmdHis'));
+        $pendingName = (string)$line['pending_name'];
+        $createAs    = strtolower(trim((string)input('create_as', 'inventory')));
+
+        if ($createAs === 'asset') {
+            try {
+                db()->beginTransaction();
+                // 1. Model named after the new item.
+                $modelCode = shr_next_model_code();
+                db_exec(
+                    'INSERT INTO asset_models (code, name, is_active) VALUES (?, ?, 1)',
+                    [$modelCode, $pendingName]
+                );
+                $modelId = (int)db()->lastInsertId();
+                // 2. Asset (A-NNNNN) named after the new item.
+                $assetTag = shr_next_asset_tag();
+                db_exec(
+                    "INSERT INTO assets (asset_tag, asset_name, model_id, status, created_by)
+                     VALUES (?, ?, ?, 'active', ?)",
+                    [$assetTag, $pendingName, $modelId, $uid]
+                );
+                $assetId = (int)db()->lastInsertId();
+                // 3. Convert the receive line into an asset line.
+                db_exec(
+                    "UPDATE inv_shipment_lines
+                        SET entity_type = 'asset', asset_id = ?, pending_name = NULL
+                      WHERE id = ?",
+                    [$assetId, (int)$line['id']]
+                );
+                // 4. Record the asset receipt into QC Hold + close the line.
+                asset_txn_record(
+                    $assetId,
+                    'receive_vendor',
+                    ['to_location_id' => $qchLocId],
+                    $uid,
+                    'Auto: received via ' . $sh['ship_no']
+                );
+                db_exec(
+                    'UPDATE inv_shipment_lines SET qty_received = qty_planned WHERE id = ?',
+                    [(int)$line['id']]
+                );
+                db()->commit();
+            } catch (\Throwable $e) {
+                if (db()->inTransaction()) db()->rollBack();
+                flash_set('error', 'Could not create the asset on receipt: ' . $e->getMessage());
+                redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+            }
+            db_exec(
+                "INSERT INTO audit_log (actor_id, action, target_id, details) VALUES (?, 'shiprcpt.receive_asset', ?, ?)",
+                [$uid, $id, $sh['ship_no'] . ' new asset ' . $assetTag . ' (' . $pendingName . ')']
+            );
+            flash_set('success', 'New asset ' . $assetTag . ' created and received at LOC-QCH.');
+            redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+        }
+
+        // Default: materialise as an inventory item. Mint the code from
+        // the SAME source as manual item creation — code_next('inv_item'),
+        // which reads the code_sequences config and increments from the
+        // last I-NNNNN (e.g. I-02000 → I-02001). (inv_id_generate() lives
+        // in includes/inventory/items.php, which this page doesn't load,
+        // so we call the underlying code_next() directly — _codes.php is
+        // required at the top of this file.)
+        $newCode = code_next('inv_item');
         try {
             db_exec(
-                'INSERT INTO inv_items (code, name, uom_id, is_active)
-                  VALUES (?, ?, ?, 1)',
-                [$newCode, (string)$line['pending_name'],
+                'INSERT INTO inv_items (code, name, short_description, uom_id, is_active)
+                  VALUES (?, ?, ?, ?, 1)',
+                [$newCode, $pendingName, $pendingName,
                  !empty($line['pending_uom_id']) ? (int)$line['pending_uom_id']
                      : (!empty($line['uom_id']) ? (int)$line['uom_id'] : null)]
             );
@@ -3943,12 +4071,22 @@ if ($action === 'view') {
                             <?php foreach ($lines as $L):
                                 if ($L['line_kind'] !== 'receive') continue;
                                 $rem = max(0, (float)$L['qty_planned'] - (float)$L['qty_received']);
+                                $isPending = (empty($L['item_id']) && !empty($L['pending_name']));
+                                $optLabel  = $isPending ? ($L['pending_name'] . ' (new item)') : $L['item_code'];
                             ?>
-                                <option value="<?= (int)$L['id'] ?>" data-open="<?= h(number_format($rem, 3, '.', '')) ?>">
-                                    <?= h($L['item_code']) ?> — open: <?= h(rtrim(rtrim(number_format($rem, 3, '.', ''), '0'), '.')) ?> <?= h($L['item_uom']) ?>
+                                <option value="<?= (int)$L['id'] ?>" data-open="<?= h(number_format($rem, 3, '.', '')) ?>" data-pending="<?= $isPending ? '1' : '0' ?>">
+                                    <?= h($optLabel) ?> — open: <?= h(rtrim(rtrim(number_format($rem, 3, '.', ''), '0'), '.')) ?> <?= h($L['item_uom']) ?>
                                 </option>
                             <?php endforeach; ?>
                         </select>
+                    </div>
+                    <!-- New-item type chooser — only shown for "New item" receive lines -->
+                    <div class="field" id="shr-create-as-wrap" style="grid-column: 1 / -1; display:none;">
+                        <label>This is a <strong>new item</strong> — create it as</label>
+                        <div style="display:flex; gap:18px; padding:4px 0;">
+                            <label style="font-weight:400;"><input type="radio" name="create_as" value="inventory" checked> Inventory item <span class="muted small">(I-NNNNN)</span></label>
+                            <label style="font-weight:400;"><input type="radio" name="create_as" value="asset"> Asset <span class="muted small">(A-NNNNN, with a matching model)</span></label>
+                        </div>
                     </div>
                     <div class="field">
                         <label>Qty</label>
@@ -3990,13 +4128,21 @@ if ($action === 'view') {
                     var sel  = document.getElementById('shr-receive-line');
                     var qty  = document.getElementById('shr-qty-received');
                     var hint = document.getElementById('shr-qty-hint');
+                    var createAsWrap = document.getElementById('shr-create-as-wrap');
                     if (!sel || !qty) return;
                     function openQty() {
                         var opt = sel.options[sel.selectedIndex];
                         var v = opt ? parseFloat(opt.getAttribute('data-open')) : NaN;
                         return isNaN(v) ? null : v;
                     }
+                    function syncCreateAs() {
+                        if (!createAsWrap) return;
+                        var opt = sel.options[sel.selectedIndex];
+                        var pending = opt && opt.getAttribute('data-pending') === '1';
+                        createAsWrap.style.display = pending ? '' : 'none';
+                    }
                     function sync() {
+                        syncCreateAs();
                         var open = openQty();
                         if (open === null) {
                             qty.removeAttribute('max');

@@ -32,6 +32,15 @@
     // it after SPA re-init.
     var BOUND_CLASS = 'cb-bound';
 
+    // Normalise a string for matching: lower-case and strip everything
+    // that isn't a letter or digit. This makes search separator-agnostic
+    // so typing "qc hold" matches the option labelled "QC-Hold", and
+    // "main store" matches "Main Store (FFStore)". Used for both the live
+    // filter and the commit-on-blur/submit resolver.
+    function cbNorm(s) {
+        return (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+    }
+
     function shouldEnhance(sel) {
         if (sel.multiple) return false;
         if (sel.classList.contains('no-combobox')) return false;
@@ -142,10 +151,10 @@
 
         function renderMenu(query) {
             menu.innerHTML = '';
-            var q = (query || '').toLowerCase();
+            var q = cbNorm(query);
             var any = false;
             items.forEach(function (it, idx) {
-                if (q && it.label.toLowerCase().indexOf(q) === -1) {
+                if (q && cbNorm(it.label).indexOf(q) === -1) {
                     it.element = null;
                     return;
                 }
@@ -174,6 +183,34 @@
             input.value = found ? found.label : '';
             // Fire change so any listeners on the <select> see the update
             sel.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+
+        // Resolve the user's typed text to an option value when it is
+        // unambiguous, and commit it to the underlying <select>. This is
+        // what makes "type the name, then click Save" work — without it,
+        // a typed-but-not-clicked entry leaves the <select> empty and the
+        // form posts no value (e.g. "Pick a destination location.").
+        //
+        // Resolution order:
+        //   1. already in sync (input matches current selection) → no-op
+        //   2. exact normalised label match → commit it
+        //   3. exactly one option whose label contains the typed text → commit
+        //   4. ambiguous (0 or >1 matches) → leave as-is; user must pick
+        function commitTyped() {
+            var cur = items.find(function (it) { return it.value === sel.value; });
+            if (cur && input.value === cur.label) return;     // (1)
+            var typed = input.value.trim();
+            if (!typed) return;
+            var norm = cbNorm(typed);
+            if (!norm) return;
+            var exact = items.filter(function (it) {
+                return !it.disabled && cbNorm(it.label) === norm;
+            });
+            if (exact.length === 1) { setValue(exact[0].value); return; }   // (2)
+            var partial = items.filter(function (it) {
+                return !it.disabled && cbNorm(it.label).indexOf(norm) !== -1;
+            });
+            if (partial.length === 1) { setValue(partial[0].value); }       // (3)
         }
 
         // Initial value
@@ -242,7 +279,10 @@
             wrap.classList.remove('cb-open');
             window.removeEventListener('scroll', onScrollOrResize, true);
             window.removeEventListener('resize', onScrollOrResize);
-            // Restore label of current value (user may have typed garbage)
+            // Commit an unambiguous typed entry the user never explicitly
+            // clicked, then restore the label of the current value (user may
+            // have typed garbage or an ambiguous fragment).
+            commitTyped();
             var found = items.find(function (it) { return it.value === sel.value; });
             input.value = found ? found.label : '';
         }
@@ -351,6 +391,15 @@
         sel.addEventListener('change', function () {
             wrap._cbResync();
         });
+
+        // Commit a typed-but-unclicked entry when the owning form submits.
+        // Clicking a Save button submits immediately — before the input's
+        // deferred blur/close fires — so without this the <select> would
+        // still be empty at POST time. Capture phase runs before the
+        // browser gathers form values. No-op when already in sync.
+        if (sel.form) {
+            sel.form.addEventListener('submit', commitTyped, true);
+        }
     }
 
     function initAll(root) {

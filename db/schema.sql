@@ -146,6 +146,7 @@ CREATE TABLE `asset_transactions` (
   `next_cal_due_on` date DEFAULT NULL,
   `notes` varchar(500) DEFAULT NULL,
   `due_date` date DEFAULT NULL,
+  `txn_date` date DEFAULT NULL,
   `actor_id` int(10) unsigned DEFAULT NULL,
   `at` datetime NOT NULL DEFAULT current_timestamp(),
   PRIMARY KEY (`id`),

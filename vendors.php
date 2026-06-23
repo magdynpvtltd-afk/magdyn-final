@@ -81,19 +81,33 @@ if ($action === 'save') {
         flash_set('success', 'Vendor saved.');
         redirect(url('/vendors.php?action=edit&id=' . $id));
     } else {
-        // Auto-generate code on create; immutable thereafter.
-        $code = vendor_code_generate();
-        db_exec(
-            'INSERT INTO vendors
-                (code, name, gst_no, pan_no,
-                 bank_account_name, bank_account_number, bank_ifsc, bank_swift,
-                 bank_name, bank_branch, payment_terms, notes, is_active)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            [$code, $data['name'], $data['gst_no'], $data['pan_no'],
-             $data['bank_account_name'], $data['bank_account_number'], $data['bank_ifsc'], $data['bank_swift'],
-             $data['bank_name'], $data['bank_branch'], $data['payment_terms'], $data['notes'], $data['is_active']]
-        );
-        $newId = (int)db()->lastInsertId();
+        // Code is derived from the row's own id (V-XXXXX, zero-filled to 5
+        // digits) so it always increments from the last id and matches the
+        // bulk "Update Vendor Code" tool. Insert with a temporary unique code
+        // first, then rewrite it from lastInsertId() in one transaction.
+        $pdo = db();
+        $pdo->beginTransaction();
+        try {
+            $tmpCode = vendor_code_generate();
+            db_exec(
+                'INSERT INTO vendors
+                    (code, name, gst_no, pan_no,
+                     bank_account_name, bank_account_number, bank_ifsc, bank_swift,
+                     bank_name, bank_branch, payment_terms, notes, is_active)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [$tmpCode, $data['name'], $data['gst_no'], $data['pan_no'],
+                 $data['bank_account_name'], $data['bank_account_number'], $data['bank_ifsc'], $data['bank_swift'],
+                 $data['bank_name'], $data['bank_branch'], $data['payment_terms'], $data['notes'], $data['is_active']]
+            );
+            $newId = (int)$pdo->lastInsertId();
+            $code  = 'V-' . str_pad((string)$newId, 5, '0', STR_PAD_LEFT);
+            db_exec('UPDATE vendors SET code = ? WHERE id = ?', [$code, $newId]);
+            $pdo->commit();
+        } catch (Throwable $e) {
+            $pdo->rollBack();
+            flash_set('error', 'Vendor create failed: ' . $e->getMessage());
+            redirect(url('/vendors.php?action=new'));
+        }
         flash_set('success', sprintf('Vendor %s created. Now add contacts and addresses.', $code));
         redirect(url('/vendors.php?action=edit&id=' . $newId));
     }

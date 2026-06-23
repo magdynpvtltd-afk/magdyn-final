@@ -678,6 +678,172 @@ if ($action === 'item_clone') {
 
 
 // ============================================================
+// ITEM view (read-only detail page)
+// ============================================================
+if ($action === 'item_view') {
+    if (!$canViewItems) require_permission('inventory_view_items', 'view');
+
+    require_once dirname(__DIR__, 2) . '/includes/_notes.php';
+    if (notes_handle_action()) {
+        redirect(url('/inventory.php?action=item_view&id=' . (int)input('entity_id', 0)));
+    }
+
+    $id = (int)input('id', 0);
+    $it = db_one(
+        "SELECT i.*,
+                u.label AS uom_label,
+                c.name  AS category_name,
+                d.name  AS division_name,
+                ps.label AS process_step_label
+           FROM inv_items i
+           LEFT JOIN inv_uom u            ON u.id  = i.uom_id
+           LEFT JOIN categories c         ON c.id  = i.category_id
+           LEFT JOIN categories d         ON d.id  = i.division_id
+           LEFT JOIN inv_process_steps ps ON ps.id = i.process_step_id
+          WHERE i.id = ?",
+        [$id]
+    );
+    if (!$it) {
+        flash_set('error', 'Item not found.');
+        redirect(url('/inventory.php?action=items'));
+    }
+
+    // Vendors (when externally manufactured) and certifications.
+    $vendorRows = db_all(
+        'SELECT v.name, v.code
+           FROM inv_item_vendors iv
+           JOIN vendors v ON v.id = iv.vendor_id
+          WHERE iv.item_id = ?
+          ORDER BY iv.sort_order',
+        [$id]
+    );
+    $certRows = db_all(
+        'SELECT ct.label
+           FROM inv_item_certs ic
+           JOIN inv_cert_types ct ON ct.id = ic.cert_id
+          WHERE ic.item_id = ?
+          ORDER BY ct.sort_order, ct.label',
+        [$id]
+    );
+
+    // Stock per location.
+    $locationStocks = db_all(
+        'SELECT l.code AS loc_code, l.name AS loc_name, s.qty
+           FROM inv_item_location_stock s
+           JOIN locations l ON l.id = s.location_id
+          WHERE s.item_id = ?
+          ORDER BY l.name',
+        [$id]
+    );
+
+    $childCount = (int)db_val('SELECT COUNT(*) FROM inv_bom_lines WHERE parent_item_id = ?', [$id], 0);
+
+    $fmtNum = function ($v) {
+        if ($v === null || $v === '') return '—';
+        $s = rtrim(rtrim(number_format((float)$v, 3), '0'), '.');
+        return $s === '' ? '0' : $s;
+    };
+    $val = function ($v) { return ($v ?? '') !== '' ? h($v) : '—'; };
+
+    $page_title  = 'Item ' . $it['code'];
+    $page_module = 'inventory';
+    $focus_id    = '';
+    require dirname(__DIR__, 2) . '/includes/header.php';
+    ?>
+    <div class="page-head">
+        <div>
+            <h1>
+                <code><?= h($it['code']) ?></code>
+                <?= $it['is_active']
+                    ? '<span class="pill pill-active">active</span>'
+                    : '<span class="pill pill-neutral">inactive</span>' ?>
+            </h1>
+            <p class="muted"><?= h($it['short_description'] ?: $it['name']) ?></p>
+        </div>
+        <div class="head-actions">
+            <a class="btn btn-ghost" href="<?= h(url('/inventory.php?action=items')) ?>"
+               data-shortcut="B" accesskey="b"><?= shortcut_label('← Back', 'B') ?></a>
+            <?= notes_popup_button('inv_item', (int)$it['id'], 'Notes', 'N') ?>
+            <a class="btn btn-ghost" href="<?= h(url('/inventory.php?action=ledger&id=' . (int)$it['id'])) ?>">📒 Ledger</a>
+            <a class="btn btn-ghost" href="<?= h(url('/inventory.php?action=bom_view&id=' . (int)$it['id'])) ?>">View BOM tree →</a>
+            <?php if ($canManageItems): ?>
+                <a class="btn btn-primary" href="<?= h(url('/inventory.php?action=item_edit&id=' . (int)$it['id'])) ?>"
+                   data-shortcut="E" accesskey="e"><?= shortcut_label('Edit', 'E') ?></a>
+            <?php endif; ?>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-body">
+            <div class="form-grid">
+                <div class="field"><label>Inventory Code</label><div><code><?= h($it['code']) ?></code></div></div>
+                <div class="field"><label>Short Description</label><div><?= $val($it['short_description']) ?></div></div>
+                <div class="field"><label>Category</label><div><?= $val($it['category_name']) ?></div></div>
+                <div class="field"><label>I_Division</label><div><?= $val($it['division_name']) ?></div></div>
+                <div class="field"><label>Manufacturer</label><div>
+                    <?= $it['manufacturer_type'] === 'external'
+                        ? '<span class="pill pill-info">external</span>'
+                        : '<span class="pill pill-neutral">internal</span>' ?>
+                    <?php if ($it['manufacturer_type'] === 'external' && $vendorRows): ?>
+                        <div class="small" style="margin-top:4px;">
+                            <?php foreach ($vendorRows as $vr): ?>
+                                <span class="pill pill-neutral"><?= h($vr['name']) ?> (<?= h($vr['code']) ?>)</span>
+                            <?php endforeach; ?>
+                        </div>
+                    <?php endif; ?>
+                </div></div>
+                <div class="field"><label>I_UOM</label><div><?= $val($it['uom_label']) ?></div></div>
+                <div class="field span-2"><label>Part Name</label><div><?= nl2br($val($it['long_description'])) ?></div></div>
+
+                <div class="field"><label>Part_No</label><div><?= $val($it['part_no']) ?></div></div>
+                <div class="field"><label>Part Rev No</label><div><?= $val($it['part_rev_no']) ?></div></div>
+                <div class="field"><label>Dwg_No</label><div><?= $val($it['dwg_no']) ?></div></div>
+                <div class="field"><label>Dwg Rev_No</label><div><?= $val($it['dwg_rev_no']) ?></div></div>
+                <div class="field"><label>ECN</label><div><?= $val($it['ecn']) ?></div></div>
+
+                <div class="field span-2"><label>Process Spec</label><div><?= nl2br($val($it['process_spec'])) ?></div></div>
+                <div class="field"><label>ProcessStep</label><div><?= $val($it['process_step_label']) ?></div></div>
+                <div class="field"><label>StepNo</label><div><?= $val($it['step_no']) ?></div></div>
+                <div class="field"><label>I_Step time (min)</label><div><?= $fmtNum($it['step_time_min']) ?></div></div>
+                <div class="field"><label>I_Step Cost (₹)</label><div><?= $fmtNum($it['step_cost']) ?></div></div>
+
+                <div class="field"><label>Min Stock Level</label><div><?= $fmtNum($it['min_stock_level']) ?></div></div>
+                <div class="field"><label>Min Order Qty</label><div><?= $fmtNum($it['min_order_qty']) ?></div></div>
+                <div class="field"><label>Min sample Qty</label><div><?= $fmtNum($it['min_sample_qty']) ?></div></div>
+                <div class="field"><label>Min sample percentage (%)</label><div><?= $fmtNum($it['min_sample_pct']) ?></div></div>
+
+                <div class="field"><label>CERT</label><div>
+                    <?php if ($certRows): ?>
+                        <?php foreach ($certRows as $cr): ?>
+                            <span class="pill pill-neutral"><?= h($cr['label']) ?></span>
+                        <?php endforeach; ?>
+                    <?php else: ?>—<?php endif; ?>
+                </div></div>
+                <div class="field"><label>Material Spec</label><div><?= $val($it['material_spec']) ?></div></div>
+                <div class="field"><label>BOM lines</label><div><?= $childCount ?></div></div>
+
+                <div class="field span-2"><label>Location(s)</label><div>
+                    <?php if ($locationStocks): ?>
+                        <?php foreach ($locationStocks as $ls): ?>
+                            <span class="pill pill-neutral" title="<?= h($ls['loc_name']) ?>"><?= h($ls['loc_code']) ?>: <?= $fmtNum($ls['qty']) ?></span>
+                        <?php endforeach; ?>
+                    <?php else: ?>
+                        <span class="muted small">No stock at any location</span>
+                    <?php endif; ?>
+                </div></div>
+
+                <div class="field span-2"><label>Remarks</label><div><?= $val($it['remarks']) ?></div></div>
+                <div class="field span-2"><label>Notes</label><div><?= nl2br($val($it['notes'])) ?></div></div>
+            </div>
+        </div>
+    </div>
+
+    <?php notes_popup_assets(); ?>
+    <?php require dirname(__DIR__, 2) . '/includes/footer.php'; exit;
+}
+
+
+// ============================================================
 // ITEMS list (datatable)
 // ============================================================
 if ($action === 'items') {
@@ -698,6 +864,7 @@ if ($action === 'items') {
         'id'       => 'inv_items',
         'base_sql' => 'SELECT i.id, i.code, i.name, i.short_description, i.unit_cost,
                               i.manufacturer_type, i.is_active, i.uom_id, i.category_id,
+                              i.part_no, i.part_rev_no, i.dwg_no, i.dwg_rev_no,
                               i.stock_on_hand,
                               u.label AS uom_label,
                               c.name  AS category_name,
@@ -719,6 +886,10 @@ if ($action === 'items') {
              // included in the prefix here and the cell is also the
              // link to item_edit.
              'sql_col'=>"CONCAT('(', i.code, ')-', COALESCE(NULLIF(i.short_description, ''), i.name))"],
+            ['key'=>'part_no',      'label'=>'Part No',        'sortable'=>true, 'searchable'=>true, 'sql_col'=>'i.part_no'],
+            ['key'=>'part_rev_no',  'label'=>'Part Rev No',    'sortable'=>true, 'searchable'=>true, 'sql_col'=>'i.part_rev_no'],
+            ['key'=>'dwg_no',       'label'=>'Drawing No',     'sortable'=>true, 'searchable'=>true, 'sql_col'=>'i.dwg_no'],
+            ['key'=>'dwg_rev_no',   'label'=>'Drawing Rev No', 'sortable'=>true, 'searchable'=>true, 'sql_col'=>'i.dwg_rev_no'],
             ['key'=>'category_name', 'label'=>'Category', 'sortable'=>true, 'searchable'=>true, 'sql_col'=>'c.name'],
             ['key'=>'uom_label',     'label'=>'UoM',      'sortable'=>true, 'searchable'=>true, 'sql_col'=>'u.label'],
             ['key'=>'location_code', 'label'=>'Location', 'sortable'=>true, 'searchable'=>true, 'sql_col'=>'l.code'],
@@ -758,7 +929,7 @@ if ($action === 'items') {
         // AND the link to item_edit — we used to have a separate Inv
         // Id column for that link, but the code is now redundant with
         // the prefix shown here, so the column was dropped.
-        $itemLabel = '<strong><a href="' . h(url('/inventory.php?action=item_edit&id=' . (int)$i['id'])) . '">'
+        $itemLabel = '<strong><a href="' . h(url('/inventory.php?action=item_view&id=' . (int)$i['id'])) . '">'
                    . '(' . h($i['code']) . ')-' . h($i['short_description'] ?: $i['name'])
                    . '</a></strong>';
         $mfr = $i['manufacturer_type'] === 'external'
@@ -851,6 +1022,10 @@ if ($action === 'items') {
         }
         return [
             'short_description' => $itemLabel,
+            'part_no'           => h($i['part_no'] ?: '—'),
+            'part_rev_no'       => h($i['part_rev_no'] ?: '—'),
+            'dwg_no'            => h($i['dwg_no'] ?: '—'),
+            'dwg_rev_no'        => h($i['dwg_rev_no'] ?: '—'),
             'category_name'     => h($i['category_name'] ?: '—'),
             'uom_label'         => h($i['uom_label'] ?: '—'),
             'location_code'     => $locCell,

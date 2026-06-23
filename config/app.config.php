@@ -16,6 +16,7 @@ return [
     // If you serve it at https://example.com/magdyn use '/magdyn'.
     // If you serve it at the document root, use ''.
     'base_url'    => '/magdyn-Final/magdyn',
+    // 'base_url' => '/magdyn-Final/magdyn/.claude/worktrees/amazing-darwin-70ecdc',
 
     // ---- Locale ----
     'timezone'    => 'Asia/Kolkata',

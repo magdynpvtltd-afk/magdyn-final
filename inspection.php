@@ -3258,6 +3258,14 @@ if ($action === 'template_edit' || $action === 'template_new') {
                 $tolPlus  = trim((string)($dim['tolPlus']  ?? ''));
                 $unitRaw  = trim((string)($dim['unit']     ?? ''));
                 $gdtSym   = trim((string)($dim['gdtSym']   ?? ''));
+                // Inspection-template fields set in the bubble detail editor.
+                $dimNotes     = trim((string)($dim['notes']        ?? ''));
+                $dimCheckType = trim((string)($dim['checkType']    ?? ''));
+                $dimInstrId   = (int)($dim['instrumentId'] ?? 0);
+                // `required` defaults to true when the key is absent (older
+                // bubbles); only an explicit false unticks the row.
+                $dimRequired  = array_key_exists('required', $dim)
+                                    ? (int)!empty($dim['required']) : 1;
 
                 // The bubble number drawn on the page. The newer wire
                 // format sends `num` (the canonical number); the older
@@ -3302,7 +3310,16 @@ if ($action === 'template_edit' || $action === 'template_new') {
                 $label = implode(' ', $labelParts);
                 if ($label === '') $label = 'Bubble ' . ($bubbleNum !== '' ? $bubbleNum : '?');
 
-                $checkType = $nom !== '' && is_numeric($nom) ? 'numeric' : 'visual';
+                // Check type: honor an explicit choice from the bubble
+                // editor when it's one of the known template types;
+                // otherwise auto-derive (numeric when a nominal exists).
+                $validCheckTypes = ['boolean','numeric','text','visual','nom',
+                                    'min-max','logic','logical-min-max','logical-nom','notes'];
+                if ($dimCheckType !== '' && in_array($dimCheckType, $validCheckTypes, true)) {
+                    $checkType = $dimCheckType;
+                } else {
+                    $checkType = $nom !== '' && is_numeric($nom) ? 'numeric' : 'visual';
+                }
                 $targetVal = $nom !== '' && is_numeric($nom) ? (float)$nom : null;
                 // tolerance_lower/upper are stored as positive magnitudes:
                 //   min = target - lower,  max = target + upper
@@ -3330,7 +3347,9 @@ if ($action === 'template_edit' || $action === 'template_new') {
                     'tolerance_lower'      => $tolLow,
                     'tolerance_upper'      => $tolHi,
                     'unit'                 => $unit ?: null,
-                    'is_required'          => 1,
+                    'notes'                => $dimNotes !== '' ? $dimNotes : null,
+                    'instrument_asset_id'  => $dimInstrId ?: null,
+                    'is_required'          => $dimRequired,
                     'source_attachment_id' => $attachmentId ?: null,
                     'bubble_page'          => isset($b['page']) ? (int)$b['page'] : null,
                     'bubble_grid_cell'     => isset($b['grid_cell']) && $b['grid_cell'] !== ''
@@ -3634,6 +3653,10 @@ if ($action === 'template_edit' || $action === 'template_new') {
                 <button type="button" id="tpl-bubble-launch-btn" class="btn btn-ghost btn-sm"
                         style="margin-left: 12px; vertical-align: middle;"
                         title="Upload a drawing (PDF or image) and add inspection items by drawing bubbles on it">⊕ Bubble drawing → items</button>
+                <button type="button" id="tpl-bubble-csv-btn" class="btn btn-ghost btn-sm"
+                        style="margin-left: 6px; vertical-align: middle;"
+                        title="Import checklist items from a bubble-data CSV (columns: bubbleno, parametername, unitofmeasure, nomvalue, tolneg, tolpos, minimum, maximum, toltype, processtype, howmeasure, notes)">⊕ Import bubble data (CSV)</button>
+                <input type="file" id="tpl-bubble-csv-input" accept=".csv,text/csv" hidden>
             </p>
             <?php if ($pendingAnnotatedAttach !== ''): ?>
                 <input type="hidden" name="pending_annotated_path" value="<?= h($pendingAnnotatedAttach) ?>">
@@ -4032,6 +4055,187 @@ if ($action === 'template_edit' || $action === 'template_new') {
                 d.hidden = true;
             });
         });
+
+        // -----------------------------------------------------------
+        // Import bubble data from CSV
+        // -----------------------------------------------------------
+        // One CSV row → one checklist item. Recognised headers (case-
+        // insensitive, order-independent):
+        //   bubbleno, parametername, unitofmeasure, nomvalue, tolneg,
+        //   tolpos, minimum, maximum, toltype, processtype, howmeasure,
+        //   notes
+        // Existing rows are kept; imported rows are appended.
+        var csvBtn   = document.getElementById('tpl-bubble-csv-btn');
+        var csvInput = document.getElementById('tpl-bubble-csv-input');
+
+        // Minimal RFC-4180 parser: handles quoted fields, embedded
+        // commas/newlines and "" escapes. Strips a leading BOM.
+        function parseCsv(text) {
+            text = text.replace(/^﻿/, '');
+            var rows = [], cur = [], field = '', inQ = false, i = 0;
+            while (i < text.length) {
+                var ch = text[i];
+                if (inQ) {
+                    if (ch === '"') {
+                        if (text[i + 1] === '"') { field += '"'; i += 2; continue; }
+                        inQ = false; i++; continue;
+                    }
+                    field += ch; i++; continue;
+                }
+                if (ch === '"') { inQ = true; i++; continue; }
+                if (ch === ',') { cur.push(field); field = ''; i++; continue; }
+                if (ch === '\r') { i++; continue; }
+                if (ch === '\n') { cur.push(field); rows.push(cur); cur = []; field = ''; i++; continue; }
+                field += ch; i++;
+            }
+            if (field !== '' || cur.length) { cur.push(field); rows.push(cur); }
+            return rows;
+        }
+
+        // Map a CSV toltype to one of our check_type <option> values.
+        function mapCheckType(t) {
+            t = (t || '').toLowerCase().replace(/[\s_]+/g, '');
+            switch (t) {
+                case 'nom':                                           return 'nom';
+                case 'logic': case 'logical':                         return 'logic';
+                case 'logic-nom': case 'logical-nom': case 'logicnom':
+                case 'logicalnom':                                    return 'logical-nom';
+                case 'min-max': case 'minmax': case 'min/max':        return 'min-max';
+                case 'logic-min-max': case 'logical-min-max':
+                case 'logicminmax': case 'logicalminmax':
+                case 'logic-minmax':                                  return 'logical-min-max';
+                case 'note': case 'notes':                            return 'notes';
+                case 'boolean': case 'passfail': case 'pass/fail':    return 'boolean';
+                case 'visual':                                        return 'visual';
+                case 'text':                                          return 'text';
+                case 'numeric': case 'num':                           return 'numeric';
+                default:                                              return 'numeric';
+            }
+        }
+
+        function setVal(row, sel, val) {
+            var el = row.querySelector(sel);
+            if (el) el.value = (val == null ? '' : String(val));
+        }
+
+        // Match a free-text unit (e.g. "mm", "degree") to a UOM <option>.
+        function setUnit(row, unitStr) {
+            unitStr = (unitStr || '').trim();
+            if (!unitStr) return;
+            var sel = row.querySelector('select[name="item_unit[]"]');
+            if (!sel) { // text-input fallback when no UOMs are configured
+                var inp = row.querySelector('input[name="item_unit[]"]');
+                if (inp) inp.value = unitStr;
+                return;
+            }
+            var want = unitStr.toLowerCase();
+            var aliases = { 'degree': 'deg', 'degrees': 'deg', 'inch': 'in',
+                            'inches': 'in', 'millimetre': 'mm', 'millimeter': 'mm',
+                            'pieces': 'count', 'pcs': 'count' };
+            var target = aliases[want] || want;
+            var opts = sel.options, i;
+            // 1) exact code (option value) match
+            for (i = 0; i < opts.length; i++) {
+                if (opts[i].value && opts[i].value.toLowerCase() === target) { sel.value = opts[i].value; return; }
+            }
+            // 2) match against the symbol part of the label ("mm — Millimetre")
+            for (i = 0; i < opts.length; i++) {
+                var head = opts[i].text.toLowerCase().split('—')[0].trim();
+                if (head === want || head === target) { sel.value = opts[i].value; return; }
+            }
+            // 3) match against the full name in the label
+            for (i = 0; i < opts.length; i++) {
+                if (opts[i].text.toLowerCase().indexOf(want) !== -1) { sel.value = opts[i].value; return; }
+            }
+            // No match — leave the unit unset rather than guess.
+        }
+
+        function importBubbleCsv(text) {
+            var rows = parseCsv(text);
+            if (!rows.length) { alert('The CSV file appears to be empty.'); return; }
+            var header = rows[0].map(function (s) { return (s || '').trim().toLowerCase(); });
+            var col = {};
+            header.forEach(function (name, idx) { if (name) col[name] = idx; });
+            if (col.parametername == null && col.bubbleno == null) {
+                alert('Unrecognised CSV. Expected a header row with at least "bubbleno" and "parametername".');
+                return;
+            }
+            var data = rows.slice(1).filter(function (r) {
+                return r.some(function (c) { return c != null && String(c).trim() !== ''; });
+            });
+            if (!data.length) { alert('No data rows found in the CSV.'); return; }
+
+            var added = 0;
+            data.forEach(function (r) {
+                var get = function (name) {
+                    var idx = col[name];
+                    return (idx == null || r[idx] == null) ? '' : String(r[idx]).trim();
+                };
+                var tr = blankRow();
+
+                setVal(tr, '.tpl-bubble[name="item_bubble_no[]"]', get('bubbleno'));
+                setVal(tr, 'input[name="item_label[]"]', get('parametername'));
+                setUnit(tr, get('unitofmeasure'));
+
+                var ct = mapCheckType(get('toltype'));
+                var ctSel = tr.querySelector('.item-check-type-sel');
+                if (ctSel) ctSel.value = ct;
+
+                if (ct === 'min-max' || ct === 'logical-min-max') {
+                    setVal(tr, '.item-spec-lower', get('minimum'));
+                    setVal(tr, '.item-spec-upper', get('maximum'));
+                } else if (ct === 'nom' || ct === 'logical-nom' || ct === 'numeric') {
+                    setVal(tr, '.item-spec-target', get('nomvalue'));
+                    setVal(tr, '.item-spec-lower',  get('tolneg'));
+                    setVal(tr, '.item-spec-upper',  get('tolpos'));
+                }
+                // logic / notes / visual / boolean / text: no spec values.
+
+                // Carry instrument/measurement context into the notes field.
+                var notes = get('notes');
+                var how   = get('howmeasure');
+                if (how && notes && how !== notes) notes = how + ' · ' + notes;
+                else if (how && !notes)            notes = how;
+                setVal(tr, 'input[name="item_notes[]"]', notes);
+
+                body.appendChild(tr);
+                wireRow(tr); // applies spec-column visual state for the chosen type
+                added++;
+            });
+
+            if (added) {
+                // Drop any leading all-empty rows so the imported set isn't
+                // sandwiched after blank placeholders.
+                Array.prototype.forEach.call(body.querySelectorAll('tr.tpl-item-row'), function (tr) {
+                    var label  = tr.querySelector('input[name="item_label[]"]');
+                    var bubble = tr.querySelector('input[name="item_bubble_no[]"]');
+                    if (label && !label.value.trim() && (!bubble || !bubble.value.trim())) {
+                        tr.parentNode.removeChild(tr);
+                    }
+                });
+                // Always leave one blank row at the end for further edits.
+                var last = blankRow();
+                body.appendChild(last);
+                wireRow(last);
+            }
+            alert('Imported ' + added + ' checklist item' + (added === 1 ? '' : 's') + ' from CSV.');
+        }
+
+        if (csvBtn && csvInput) {
+            csvBtn.addEventListener('click', function () { csvInput.click(); });
+            csvInput.addEventListener('change', function () {
+                var file = csvInput.files && csvInput.files[0];
+                if (!file) return;
+                var reader = new FileReader();
+                reader.onload = function () {
+                    try { importBubbleCsv(String(reader.result || '')); }
+                    catch (err) { alert('Could not import CSV: ' + err.message); }
+                    csvInput.value = ''; // allow re-importing the same file
+                };
+                reader.onerror = function () { alert('Could not read the file.'); csvInput.value = ''; };
+                reader.readAsText(file);
+            });
+        }
     })();
     </script>
 

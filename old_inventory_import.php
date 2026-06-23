@@ -445,6 +445,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'delete
     redirect(url('/old_inventory_import.php'));
 }
 
+// ── POST: regenerate vendor codes (V-00001, V-00002, …) ──────────────────────
+// Rewrites every vendor's `code` to V-<id> zero-filled to 5 digits. The id is
+// already unique, so the resulting code is unique too (vendors.code is a UNIQUE
+// key). Runs in one atomic UPDATE.
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'update_vendor_codes') {
+    csrf_check();
+    require_permission('vendors', 'manage');
+
+    try {
+        $updated = db_exec("UPDATE vendors SET code = CONCAT('V-', LPAD(id, 5, '0'))");
+        flash_set('success', "Vendor codes updated to the V-00000 format ({$updated} vendor(s)).");
+    } catch (Throwable $e) {
+        flash_set('error', 'Vendor code update failed: ' . $e->getMessage());
+    }
+
+    redirect(url('/old_inventory_import.php'));
+}
+
 // ── POST: delete imported users ──────────────────────────────────────────────
 // Deletes users one at a time, but NEVER an Administrator, never the current
 // user, and skips anyone still referenced elsewhere (created_by, actor, …).
@@ -737,6 +755,22 @@ require __DIR__ . '/includes/header.php';
             </form>
         </div>
         <?php endif; ?>
+
+        <!-- Update vendor codes (local DB; available even if the API is down) -->
+        <div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;padding:16px 20px;margin-top:20px;">
+            <p style="margin:0 0 12px;font-size:14px;color:#075985;">
+                <strong>Update Vendor Code.</strong> Rewrites every vendor's code to the
+                <code>V-XXXXX</code> format, where <code>XXXXX</code> is the vendor's id zero-filled to
+                5 digits (e.g. id <code>5</code> → <code>V-00005</code>). This overwrites all existing
+                vendor codes.
+            </p>
+            <form method="post" action="<?= h(url('/old_inventory_import.php')) ?>" style="display:inline;"
+                  onsubmit="return confirm('Rewrite ALL vendor codes to the V-00000 format?\n\nThis overwrites every existing vendor code and cannot be undone.');">
+                <?= csrf_field() ?>
+                <input type="hidden" name="action" value="update_vendor_codes">
+                <button type="submit" class="btn btn-primary">🔢 Update Vendor Code</button>
+            </form>
+        </div>
 
         <!-- Reset vendors / users (local DB; available even if the API is down) -->
         <div style="background:#fff5f5;border:1px solid #fecaca;border-radius:8px;padding:16px 20px;margin-top:20px;">

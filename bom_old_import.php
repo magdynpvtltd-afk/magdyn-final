@@ -105,6 +105,77 @@ function old_inv_resolve_vendor(string $name): int
 }
 
 /**
+ * Find an inv_uom whose label OR code matches $label (trimmed, case-insensitive).
+ * Returns the matching id, or null when nothing matches or $label is blank/'-'.
+ */
+function old_inv_match_uom(string $label): ?int
+{
+    $label = trim($label);
+    if ($label === '' || $label === '-') return null;
+
+    $row = db_one(
+        'SELECT id FROM inv_uom WHERE LOWER(label) = LOWER(?) OR LOWER(code) = LOWER(?) LIMIT 1',
+        [$label, $label]
+    );
+    return $row ? (int)$row['id'] : null;
+}
+
+/**
+ * Create a new inv_uom row from an old-system label and return its id.
+ *
+ * Code: lowercase alphanumeric slug (≤16 chars), suffixed with a counter if
+ * it collides. Label: the original text (≤64 chars). When $stats is passed it
+ * records the creation in ['uom_created'] / ['uom_created_names'].
+ */
+function old_inv_create_uom(string $label, ?array &$stats = null): int
+{
+    $label = trim($label);
+
+    $base = strtolower(preg_replace('/[^A-Za-z0-9]/', '', $label));
+    if ($base === '') $base = 'uom';
+    $base = substr($base, 0, 16);
+    $code = $base;
+    $n    = 1;
+    while ((int)db_val('SELECT COUNT(*) FROM inv_uom WHERE code = ?', [$code], 0) > 0) {
+        $suffix = (string)$n++;
+        $code   = substr($base, 0, 16 - strlen($suffix)) . $suffix;
+    }
+    $sort = (int)db_val('SELECT COALESCE(MAX(sort_order) + 1, 0) FROM inv_uom', [], 0);
+    db_exec(
+        'INSERT INTO inv_uom (code, label, sort_order, is_active) VALUES (?, ?, ?, 1)',
+        [$code, substr($label, 0, 64), $sort]
+    );
+    $id = (int)db()->lastInsertId();
+    if ($stats !== null) {
+        $stats['uom_created']++;
+        $stats['uom_created_names'][] = $label;
+    }
+    return $id;
+}
+
+/**
+ * Fetch every old inventory_model's I_UOM value, looping all API pages.
+ * Returns a flat list of [model_id, model_code, model_name, uom] rows.
+ * Throws a RuntimeException on any API error.
+ */
+function bom_old_import_fetch_all_uom(): array
+{
+    $all    = [];
+    $limit  = 1000;
+    $offset = 0;
+    while (true) {
+        $err  = '';
+        $data = txn_api_fetch('all_uom_json', $err, ['offset' => $offset, 'limit' => $limit]);
+        if ($data === null) throw new RuntimeException($err);
+        $rows = $data['uom'] ?? [];
+        foreach ($rows as $row) $all[] = $row;
+        if (count($rows) < $limit) break;
+        $offset += $limit;
+    }
+    return $all;
+}
+
+/**
  * Find an existing shipping courier by name, or create one.
  * Returns null when name is blank.
  */
@@ -1036,6 +1107,192 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'import
     }
 }
 
+// ── AJAX POST: action=uom_preview — analyze old I_UOM values (no writes) ──────
+//   Step 1 of the UOM update. Fetches each old inventory_model's I_UOM value
+//   (via api_export_transactions.php?action=all_uom_json — which joins
+//   inventory_model ⋈ inventory_model_custom_field_helper ⋈ custom_field),
+//   tallies the distinct UOM labels that affect a matching MagDyn item, and
+//   splits them into:
+//     matched   — already exist in inv_uom (auto-mapped on apply)
+//     unmatched — NEW labels with no inv_uom option (user must decide:
+//                 map to an existing UOM, or create a new one)
+//   Writes nothing — purely a preview so the UI can prompt the user.
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'uom_preview') {
+    header('Content-Type: application/json; charset=utf-8');
+    csrf_check();
+    if (!$canCreateItems && !$canManageItems) {
+        echo json_encode(['error' => 'Missing inventory_view_items.create permission.']);
+        exit;
+    }
+    @set_time_limit(300);
+
+    try {
+        $rows = bom_old_import_fetch_all_uom();
+
+        $totalModels   = 0;
+        $itemsNotFound = 0;
+        $blankUom      = 0;
+        // distinct lowercased label → ['label' => original text, 'items' => count]
+        // Only counts labels that map to an item that actually exists in MagDyn.
+        $labelItems = [];
+
+        foreach ($rows as $row) {
+            $totalModels++;
+            $modelId = trim((string)($row['model_id']   ?? ''));
+            $code    = trim((string)($row['model_code'] ?? ''));
+            $uomTxt  = trim((string)($row['uom']        ?? ''));
+
+            if ($uomTxt === '' || $uomTxt === '-') { $blankUom++; continue; }
+
+            $itemRow = null;
+            if ($modelId !== '') $itemRow = db_one('SELECT id FROM inv_items WHERE code = ? LIMIT 1', [$modelId]);
+            if (!$itemRow && $code !== '') $itemRow = db_one('SELECT id FROM inv_items WHERE code = ? LIMIT 1', [$code]);
+            if (!$itemRow) { $itemsNotFound++; continue; }
+
+            $lc = strtolower($uomTxt);
+            if (!isset($labelItems[$lc])) $labelItems[$lc] = ['label' => $uomTxt, 'items' => 0];
+            $labelItems[$lc]['items']++;
+        }
+
+        $matched   = [];
+        $unmatched = [];
+        foreach ($labelItems as $info) {
+            $uomId = old_inv_match_uom($info['label']);
+            if ($uomId !== null) {
+                $u = db_one('SELECT label FROM inv_uom WHERE id = ?', [$uomId]);
+                $matched[] = [
+                    'label'     => $info['label'],
+                    'uom_id'    => $uomId,
+                    'uom_label' => $u ? $u['label'] : '',
+                    'items'     => $info['items'],
+                ];
+            } else {
+                $unmatched[] = ['label' => $info['label'], 'items' => $info['items']];
+            }
+        }
+
+        // Heaviest-impact labels first.
+        usort($matched,   function ($a, $b) { return $b['items'] - $a['items']; });
+        usort($unmatched, function ($a, $b) { return $b['items'] - $a['items']; });
+
+        $existing = db_all('SELECT id, code, label FROM inv_uom WHERE is_active = 1 ORDER BY sort_order, label');
+
+        echo json_encode([
+            'ok'              => true,
+            'existing_uoms'   => $existing,
+            'matched'         => $matched,
+            'unmatched'       => $unmatched,
+            'total_models'    => $totalModels,
+            'items_not_found' => $itemsNotFound,
+            'blank_uom'       => $blankUom,
+        ]);
+        exit;
+    } catch (Throwable $e) {
+        http_response_code(500);
+        echo json_encode(['error' => $e->getMessage()]);
+        exit;
+    }
+}
+
+// ── AJAX POST: action=uom_apply — commit the UOM update with user decisions ───
+//   Step 2. Re-fetches the old I_UOM values and updates each matching MagDyn
+//   inv_items.uom_id. Resolution per distinct label:
+//     • already-matching label  → its existing inv_uom
+//     • unmatched label, user chose "map"    → the chosen inv_uom id
+//     • unmatched label, user chose "create" → a new inv_uom (created once)
+//   The user's decisions arrive in the `mapping` POST field as JSON keyed by
+//   the lowercased old label: { "<lc label>": {"mode":"map","uom_id":N} | {"mode":"create"} }.
+//   Items are matched by code (inventory_model_id, then inventory_model_code);
+//   no item field other than uom_id is touched.
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'uom_apply') {
+    header('Content-Type: application/json; charset=utf-8');
+    csrf_check();
+    if (!$canCreateItems && !$canManageItems) {
+        echo json_encode(['error' => 'Missing inventory_view_items.create permission.']);
+        exit;
+    }
+    @set_time_limit(300);
+
+    $mapping = json_decode((string)($_POST['mapping'] ?? ''), true);
+    if (!is_array($mapping)) $mapping = [];
+
+    $stats = [
+        'models_seen'       => 0,
+        'items_updated'     => 0,
+        'items_unchanged'   => 0,
+        'items_not_found'   => 0,
+        'blank_uom'         => 0,
+        'uom_created'       => 0,   // new inv_uom rows created
+        'uom_mapped'        => 0,   // distinct labels mapped to an existing UOM by the user
+        'uom_created_names' => [],
+    ];
+
+    try {
+        $rows = bom_old_import_fetch_all_uom();
+
+        // Resolve every distinct label → target uom_id exactly once, honouring
+        // the user's decisions for the unmatched ones.
+        $labelToUom = [];   // lowercased label => uom_id
+        foreach ($rows as $row) {
+            $uomTxt = trim((string)($row['uom'] ?? ''));
+            if ($uomTxt === '' || $uomTxt === '-') continue;
+            $lc = strtolower($uomTxt);
+            if (isset($labelToUom[$lc])) continue;
+
+            $existingId = old_inv_match_uom($uomTxt);
+            if ($existingId !== null) { $labelToUom[$lc] = $existingId; continue; }
+
+            // Unmatched — apply the user's choice (default: create a new UOM).
+            $decision = (isset($mapping[$lc]) && is_array($mapping[$lc])) ? $mapping[$lc] : ['mode' => 'create'];
+            if (($decision['mode'] ?? 'create') === 'map') {
+                $uid   = (int)($decision['uom_id'] ?? 0);
+                $valid = $uid > 0 ? db_one('SELECT id FROM inv_uom WHERE id = ?', [$uid]) : null;
+                if ($valid) { $labelToUom[$lc] = $uid; $stats['uom_mapped']++; continue; }
+            }
+            // create (explicit choice, or fallback when a map target was invalid)
+            $labelToUom[$lc] = old_inv_create_uom($uomTxt, $stats);
+        }
+
+        // Apply the resolved UOM to every matching item.
+        foreach ($rows as $row) {
+            $stats['models_seen']++;
+            $modelId = trim((string)($row['model_id']   ?? ''));
+            $code    = trim((string)($row['model_code'] ?? ''));
+            $uomTxt  = trim((string)($row['uom']        ?? ''));
+
+            if ($uomTxt === '' || $uomTxt === '-') { $stats['blank_uom']++; continue; }
+
+            $itemRow = null;
+            if ($modelId !== '') $itemRow = db_one('SELECT id, uom_id FROM inv_items WHERE code = ? LIMIT 1', [$modelId]);
+            if (!$itemRow && $code !== '') $itemRow = db_one('SELECT id, uom_id FROM inv_items WHERE code = ? LIMIT 1', [$code]);
+            if (!$itemRow) { $stats['items_not_found']++; continue; }
+
+            $uomId = $labelToUom[strtolower($uomTxt)] ?? null;
+            if (!$uomId) { $stats['blank_uom']++; continue; }
+
+            if ((int)$itemRow['uom_id'] === (int)$uomId) { $stats['items_unchanged']++; continue; }
+            db_exec(
+                'UPDATE inv_items SET uom_id = ?, updated_at = NOW() WHERE id = ?',
+                [$uomId, (int)$itemRow['id']]
+            );
+            $stats['items_updated']++;
+        }
+
+        db_exec(
+            "INSERT INTO audit_log (actor_id, action, target_id, details)
+             VALUES (?, 'inventory.old_import.uom_update', 0, ?)",
+            [current_user_id(), json_encode($stats)]
+        );
+
+        echo json_encode(array_merge(['ok' => true], $stats));
+        exit;
+    } catch (Throwable $e) {
+        http_response_code(500);
+        echo json_encode(['error' => $e->getMessage()]);
+        exit;
+    }
+}
+
 // ── AJAX POST: action=import_bom_prepare — fetch+parse, build & stash plan ────
 //   One request: pulls all trees from the old server, parses, resolves edges
 //   and parks a "plan" in the session. Does NO inserts, so it stays fast even
@@ -1697,6 +1954,219 @@ require __DIR__ . '/includes/header.php';
                     showError(err.message);
                     btn.textContent = '⬇ Retry Import';
                     btn.disabled = false;
+                }
+            });
+        })();
+        </script>
+
+        <hr style="margin:32px 0;border:none;border-top:1px solid var(--border);">
+
+        <!-- ── Update Units of Measure (UOM) from Old Server ──────────────── -->
+        <h3 style="margin:0 0 4px;">Update Units of Measure (UOM)</h3>
+        <p style="font-size:13px;color:#6b7280;margin:0 0 14px;">
+            Reads each old inventory model's <code>I_UOM</code> custom field
+            (joining <code>inventory_model</code> ⋈
+            <code>inventory_model_custom_field_helper</code> ⋈ <code>custom_field</code>)
+            and updates the matching MagDyn item's Unit of Measure. Items are matched
+            by code — old <code>inventory_model_id</code> first, then
+            <code>inventory_model_code</code>. <strong>Analyze</strong> first: any old
+            UOM with no matching option in MagDyn is listed so you can decide whether
+            to <strong>map it to an existing UOM</strong> or <strong>create a new
+            one</strong>, before anything is written. No item field other than the
+            UOM is changed.
+        </p>
+
+        <div style="display:flex;gap:10px;align-items:center;">
+            <button id="uom-analyze-btn" class="btn btn-primary"<?= $txnConnectError ? ' disabled' : '' ?>
+                    data-csrf-name="<?= h($GLOBALS['APP']['csrf_field']) ?>"
+                    data-csrf-token="<?= h(csrf_token()) ?>"
+                    data-url="<?= h(url('/bom_old_import.php')) ?>">
+                🔍 Analyze UOM from Old Server
+            </button>
+            <span class="muted small">Step 1 — preview new UOMs before applying.</span>
+        </div>
+        <?php if ($txnConnectError): ?>
+        <p style="font-size:12px;color:#dc2626;margin:6px 0 0;">
+            Transactions API unreachable — deploy <code>api_export_transactions.php</code>
+            to <code>/inventory/</code> on the old server first.
+        </p>
+        <?php endif; ?>
+
+        <!-- Review panel (hidden until Analyze completes) -->
+        <div id="uom-panel" style="display:none;margin-top:16px;">
+            <div id="uom-summary" class="alert alert-info" style="margin-bottom:14px;"></div>
+
+            <div id="uom-unmatched-wrap" style="display:none;margin-bottom:14px;">
+                <h4 style="margin:0 0 6px;">New UOMs found — choose what to do with each</h4>
+                <p style="font-size:12px;color:#6b7280;margin:0 0 10px;">
+                    These old UOM values have no matching option in MagDyn. For each one,
+                    either map it to an existing UOM or create it as a new UOM.
+                </p>
+                <table style="width:100%;border-collapse:collapse;font-size:13px;">
+                    <thead>
+                        <tr style="background:#f9fafb;text-align:left;">
+                            <th style="padding:7px 10px;border:1px solid #e5e7eb;color:#6b7280;">Old UOM</th>
+                            <th style="padding:7px 10px;border:1px solid #e5e7eb;color:#6b7280;text-align:right;">Items</th>
+                            <th style="padding:7px 10px;border:1px solid #e5e7eb;color:#6b7280;">Action</th>
+                        </tr>
+                    </thead>
+                    <tbody id="uom-unmatched-body"></tbody>
+                </table>
+            </div>
+
+            <div style="display:flex;gap:10px;align-items:center;">
+                <button id="uom-apply-btn" class="btn btn-primary"
+                        data-csrf-name="<?= h($GLOBALS['APP']['csrf_field']) ?>"
+                        data-csrf-token="<?= h(csrf_token()) ?>"
+                        data-url="<?= h(url('/bom_old_import.php')) ?>">
+                    ✅ Apply UOM Updates
+                </button>
+                <button id="uom-cancel-btn" type="button" class="btn btn-ghost">Cancel</button>
+                <span class="muted small">Step 2 — write the resolved UOM to every matching item.</span>
+            </div>
+        </div>
+
+        <div id="uom-update-result" style="display:none;margin-top:14px;"></div>
+
+        <script>
+        (function () {
+            'use strict';
+            var analyzeBtn = document.getElementById('uom-analyze-btn');
+            if (!analyzeBtn) return;
+            var applyBtn = document.getElementById('uom-apply-btn');
+            var cancelBtn = document.getElementById('uom-cancel-btn');
+            var panel    = document.getElementById('uom-panel');
+            var summary  = document.getElementById('uom-summary');
+            var unmWrap  = document.getElementById('uom-unmatched-wrap');
+            var unmBody  = document.getElementById('uom-unmatched-body');
+            var box      = document.getElementById('uom-update-result');
+
+            var existingUoms = [];   // [{id, code, label}]
+            var unmatched    = [];   // [{label, items}]
+
+            function fmt(n) { return Number(n || 0).toLocaleString(); }
+            function esc(s) {
+                return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+                    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+                });
+            }
+
+            async function post(btn, params) {
+                var body = new URLSearchParams();
+                Object.keys(params).forEach(function (k) { body.append(k, params[k]); });
+                body.append(btn.dataset.csrfName, btn.dataset.csrfToken);
+                var resp = await fetch(btn.dataset.url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded',
+                               'X-Requested-With': 'XMLHttpRequest' },
+                    body: body.toString()
+                });
+                var text = await resp.text(), data;
+                try { data = JSON.parse(text); }
+                catch (e) { throw new Error('Server returned non-JSON (HTTP ' + resp.status + '): ' + text.substring(0, 200)); }
+                if (!resp.ok || data.error) throw new Error(data.error || ('HTTP ' + resp.status));
+                return data;
+            }
+
+            // Build one <select> per unmatched label: "Create new" + every existing UOM.
+            function buildRows() {
+                unmBody.innerHTML = '';
+                unmatched.forEach(function (u, i) {
+                    var opts = '<option value="create">➕ Create new UOM “' + esc(u.label) + '”</option>';
+                    existingUoms.forEach(function (e) {
+                        opts += '<option value="' + e.id + '">↪ Map to ' + esc(e.label) +
+                                ' (' + esc(e.code) + ')</option>';
+                    });
+                    var tr = document.createElement('tr');
+                    tr.innerHTML =
+                        '<td style="padding:7px 10px;border:1px solid #e5e7eb;"><strong>' + esc(u.label) + '</strong></td>' +
+                        '<td style="padding:7px 10px;border:1px solid #e5e7eb;text-align:right;">' + fmt(u.items) + '</td>' +
+                        '<td style="padding:7px 10px;border:1px solid #e5e7eb;">' +
+                            '<select data-label="' + esc(u.label) + '" style="width:100%;max-width:380px;">' + opts + '</select>' +
+                        '</td>';
+                    unmBody.appendChild(tr);
+                });
+            }
+
+            function showResult(cls, msg) {
+                box.className = 'alert ' + cls;
+                box.innerHTML = msg;
+                box.style.display = 'block';
+            }
+
+            analyzeBtn.addEventListener('click', async function () {
+                analyzeBtn.disabled = true;
+                analyzeBtn.textContent = '⏳ Analyzing…';
+                panel.style.display = 'none';
+                box.style.display = 'none';
+                try {
+                    var data = await post(analyzeBtn, { action: 'uom_preview' });
+                    existingUoms = data.existing_uoms || [];
+                    unmatched    = data.unmatched || [];
+                    var matched  = data.matched || [];
+
+                    var s = fmt(matched.length) + ' UOM(s) already exist (auto-mapped), ' +
+                            '<strong>' + fmt(unmatched.length) + ' new UOM(s)</strong> found across ' +
+                            fmt(data.total_models) + ' old models.';
+                    if (data.items_not_found) s += ' ' + fmt(data.items_not_found) + ' model(s) had no matching MagDyn item.';
+                    if (data.blank_uom)       s += ' ' + fmt(data.blank_uom) + ' had no I_UOM value.';
+                    summary.innerHTML = s;
+
+                    if (unmatched.length) { buildRows(); unmWrap.style.display = 'block'; }
+                    else                  { unmWrap.style.display = 'none'; }
+
+                    panel.style.display = 'block';
+                    analyzeBtn.textContent = '🔄 Re-analyze';
+                    analyzeBtn.disabled = false;
+                } catch (err) {
+                    showResult('alert-error', '❌ ' + esc(err.message));
+                    analyzeBtn.textContent = '🔍 Retry Analyze';
+                    analyzeBtn.disabled = false;
+                }
+            });
+
+            cancelBtn.addEventListener('click', function () {
+                panel.style.display = 'none';
+            });
+
+            applyBtn.addEventListener('click', async function () {
+                applyBtn.disabled = true;
+                var orig = applyBtn.textContent;
+                applyBtn.textContent = '⏳ Applying…';
+                box.style.display = 'none';
+
+                // Gather the user's decision for each unmatched label.
+                var mapping = {};
+                unmBody.querySelectorAll('select').forEach(function (sel) {
+                    var label = sel.getAttribute('data-label');
+                    var v = sel.value;
+                    mapping[label.toLowerCase()] = (v === 'create')
+                        ? { mode: 'create' }
+                        : { mode: 'map', uom_id: parseInt(v, 10) };
+                });
+
+                try {
+                    var data = await post(applyBtn, {
+                        action: 'uom_apply',
+                        mapping: JSON.stringify(mapping)
+                    });
+                    var msg = '✅ UOM update complete — ' +
+                        fmt(data.items_updated)   + ' item(s) updated, ' +
+                        fmt(data.items_unchanged) + ' already correct, ' +
+                        fmt(data.uom_created)     + ' new UOM(s) created, ' +
+                        fmt(data.uom_mapped)      + ' mapped to existing UOMs.';
+                    if (data.items_not_found) msg += ' ' + fmt(data.items_not_found) + ' model(s) had no matching item.';
+                    if (data.blank_uom)       msg += ' ' + fmt(data.blank_uom) + ' had no I_UOM value.';
+                    if (data.uom_created_names && data.uom_created_names.length) {
+                        msg += '<br>New UOMs: ' + esc(data.uom_created_names.join(', ')) + '.';
+                    }
+                    showResult('alert-success', msg);
+                    panel.style.display = 'none';
+                    analyzeBtn.textContent = '🔍 Analyze UOM from Old Server';
+                } catch (err) {
+                    showResult('alert-error', '❌ ' + esc(err.message));
+                    applyBtn.textContent = orig;
+                    applyBtn.disabled = false;
                 }
             });
         })();
